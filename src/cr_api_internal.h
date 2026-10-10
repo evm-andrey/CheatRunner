@@ -64,11 +64,6 @@ void handle_api_cheats_repo_download(int fd, const char *query);
 void handle_api_cheats_repo_download_status(int fd);
 
 /* ---- /api/sources, /api/cheats/remote, /api/cheats/repo ---- */
-void handle_api_cheats_sources(int fd);
-void handle_api_cheats_remote_find(int fd, const char *query);
-void handle_api_cheats_remote_download(int fd, const char *body_json);
-void handle_api_sources_jobs_start(int fd, const char *body_json);
-void handle_api_sources_jobs_status(int fd, const char *query);
 
 /* ---- /api/dev, /api/cfg ---- */
 void handle_api_config(int fd);
@@ -89,11 +84,6 @@ void handle_api_dev_shutdown(int fd, const char *method, const char *query,
                              const char *client_ip);
 void handle_api_user_context(int fd);
 void handle_api_diag_title(int fd, const char *query);
-
-/* ---- /api/title-prefs ---- */
-void handle_api_title_prefs_get(int fd, const char *query);
-void handle_api_title_prefs_set(int fd, const char *query);
-void handle_api_title_prefs_clear(int fd, const char *query);
 
 /* ---- dashboard static assets ---- */
 void http_send_png_asset(int fd);

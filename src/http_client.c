@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <fcntl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "http_client.h"
@@ -45,10 +48,19 @@ int sceHttpGetStatusCode(int req_id, int *status_code);
 int sceHttpReadData(int req_id, void *data, size_t size);
 int sceHttpDeleteRequest(int req_id);
 int sceHttpAddRequestHeader(int req_id, const char *name, const char *value, unsigned int mode);
+int sceHttpSetAutoRedirect(int id, int enable);
+int sceHttpGetAllResponseHeaders(int req_id, char **header, size_t *header_size);
 
 static int
 http_ssl_cb(void) {
   return 0;
+}
+
+static long long
+mono_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static int
@@ -59,8 +71,9 @@ http_should_retry(int rc, int status_code) {
   return status_code == 429 || status_code == 500 || status_code == 502 || status_code == 503 || status_code == 504;
 }
 
+/* Libraries and template: set up once, then reusable for many requests. */
 static int
-http_init(http_ctx_t *ctx, const char *agent, const char *url, int timeout_ms) {
+http_session_init(http_ctx_t *ctx, const char *agent) {
   int err = 0;
 
   ctx->libnet_mem_id = -1;
@@ -93,9 +106,15 @@ http_init(http_ctx_t *ctx, const char *agent, const char *url, int timeout_ms) {
   if ((err = sceHttpsSetSslCallback(ctx->tmpl_id, http_ssl_cb, 0)) < 0) {
     return err;
   }
-  /* DNS bypass: resolve via 8.8.8.8 (PS5 DNS is 127.0.0.1) and substitute the IP
-   * into the URL; Host header keeps routing correct, ssl_cb(0) skips SNI/cert checks. */
-  char resolved_url[1024];
+  return 0;
+}
+
+/* One connection and request on an already-initialised session. */
+static int
+http_request_open(http_ctx_t *ctx, const char *url, int timeout_ms) {
+  /* DNS bypass: resolve via 8.8.8.8 (the PS5 DNS may be 127.0.0.1), put the IP in the URL and set the
+   * Host header. ssl_cb returning 0 suppresses the SNI/cert mismatch. */
+  char resolved_url[4096];
   char orig_host[256];
   orig_host[0] = '\0';
   {
@@ -143,8 +162,7 @@ http_init(http_ctx_t *ctx, const char *agent, const char *url, int timeout_ms) {
   }
   if (timeout_ms > 0) {
     unsigned int t_us = (unsigned int)timeout_ms * 1000u;
-    /* Set timeouts at all levels (template, connection, request) - some sceHttp
-     * versions only honour it at one specific level, so cover all three. */
+    /* Set timeouts on the template, connection and request: some sceHttp versions only honour one of them. */
     (void)sceHttpSetConnectTimeOut(ctx->tmpl_id, t_us);
     (void)sceHttpSetResolveTimeOut(ctx->tmpl_id, t_us);
     (void)sceHttpSetSendTimeOut(ctx->tmpl_id, t_us);
@@ -160,6 +178,15 @@ http_init(http_ctx_t *ctx, const char *agent, const char *url, int timeout_ms) {
   }
 
   return 0;
+}
+
+static int
+http_init(http_ctx_t *ctx, const char *agent, const char *url, int timeout_ms) {
+  int err = http_session_init(ctx, agent);
+  if (err < 0) {
+    return err;
+  }
+  return http_request_open(ctx, url, timeout_ms);
 }
 
 static int
@@ -250,13 +277,20 @@ http_request(http_ctx_t *ctx, uint8_t **data, size_t *len, int *status_out, size
 }
 
 static void
-http_fini(http_ctx_t *ctx) {
+http_request_close(http_ctx_t *ctx) {
   if (ctx->req_id >= 0) {
     sceHttpDeleteRequest(ctx->req_id);
+    ctx->req_id = -1;
   }
   if (ctx->conn_id >= 0) {
     sceHttpDeleteConnection(ctx->conn_id);
+    ctx->conn_id = -1;
   }
+}
+
+static void
+http_fini(http_ctx_t *ctx) {
+  http_request_close(ctx);
   if (ctx->tmpl_id >= 0) {
     sceHttpDeleteTemplate(ctx->tmpl_id);
   }
@@ -269,21 +303,6 @@ http_fini(http_ctx_t *ctx) {
   if (ctx->libnet_mem_id >= 0) {
     sceNetPoolDestroy(ctx->libnet_mem_id);
   }
-}
-
-uint8_t *
-http_get_url(const char *agent, const char *url, size_t *len) {
-  int status = 0;
-  uint8_t *body = NULL;
-  size_t body_len = 0;
-  if (http_get_url_ex(agent, url, 0, &status, &body, &body_len) != 0 || status != 200) {
-    free(body);
-    return NULL;
-  }
-  if (len) {
-    *len = body_len;
-  }
-  return body;
 }
 
 int
@@ -362,4 +381,192 @@ http_get_url_ex_timeout(const char *agent, const char *url, size_t max_bytes, in
                         int *status_out, uint8_t **data_out, size_t *len_out) {
   return http_get_url_ex_timeout_progress(agent, url, max_bytes, timeout_ms,
                                           status_out, data_out, len_out, NULL, NULL);
+}
+
+struct http_session {
+  http_ctx_t ctx;
+  long long last_read_ms, last_write_ms, last_total_ms;
+};
+
+http_session_t *
+http_session_open(const char *agent) {
+  http_session_t *se = calloc(1, sizeof(*se));
+  if (!se) {
+    return NULL;
+  }
+  if (http_session_init(&se->ctx, agent ? agent : "CheatRunner/0.1") < 0) {
+    http_fini(&se->ctx);
+    free(se);
+    return NULL;
+  }
+  return se;
+}
+
+void
+http_session_close(http_session_t *se) {
+  if (!se) {
+    return;
+  }
+  http_fini(&se->ctx);
+  free(se);
+}
+
+int
+http_session_get(http_session_t *se, const char *url, size_t max_bytes, int timeout_ms,
+                 int *status_out, uint8_t **data_out, size_t *len_out) {
+  if (!se || !url || !data_out || !len_out) {
+    return -1;
+  }
+  *data_out = NULL;
+  *len_out = 0;
+  int status = -1, rc = -1;
+  uint8_t *body = NULL;
+  size_t body_len = 0;
+  int effective_timeout_ms = timeout_ms > 0 ? timeout_ms : 8000;
+
+  for (int attempt = 0; attempt < 2; attempt++) {
+    body = NULL;
+    body_len = 0;
+    status = -1;
+    rc = http_request_open(&se->ctx, url, effective_timeout_ms);
+    if (rc == 0) {
+      se->ctx.pfn = NULL;
+      se->ctx.pud = NULL;
+      rc = http_request(&se->ctx, &body, &body_len, &status, max_bytes);
+    }
+    http_request_close(&se->ctx);
+    if (!http_should_retry(rc, status) || attempt == 1) {
+      break;
+    }
+    free(body);
+    body = NULL;
+    usleep((useconds_t)((attempt + 1) * 250000));
+  }
+  if (status_out) {
+    *status_out = status;
+  }
+  if (rc != 0) {
+    free(body);
+    return rc;
+  }
+  *data_out = body;
+  *len_out = body_len;
+  return 0;
+}
+
+/* Copies the Location header of the current response into `out`. */
+static int
+http_response_location(http_ctx_t *ctx, char *out, size_t out_sz) {
+  char *hdr = NULL;
+  size_t hdr_sz = 0;
+  if (sceHttpGetAllResponseHeaders(ctx->req_id, &hdr, &hdr_sz) < 0 || !hdr) {
+    return -1;
+  }
+  for (size_t i = 0; i + 9 < hdr_sz; i++) {
+    if ((i == 0 || hdr[i - 1] == '\n') && !strncasecmp(hdr + i, "Location:", 9)) {
+      const char *v = hdr + i + 9;
+      while (v < hdr + hdr_sz && *v == ' ') v++;
+      size_t n = 0;
+      while (v + n < hdr + hdr_sz && v[n] != '\r' && v[n] != '\n') n++;
+      if (n == 0 || n >= out_sz) {
+        return -1;
+      }
+      memcpy(out, v, n);
+      out[n] = '\0';
+      return 0;
+    }
+  }
+  return -1;
+}
+
+/* Streams a response body straight to `path` (for archives too big to hold in RAM). */
+int
+http_session_download_file(http_session_t *se, const char *url, const char *path, int timeout_ms,
+                           int *status_out, size_t *bytes_out, http_progress_fn_t pfn, void *pud) {
+  if (!se || !url || !path) {
+    return -1;
+  }
+  int status = -1, rc, fd = -1;
+  size_t total = 0;
+  long long read_ms = 0, write_ms = 0, begin_ms = mono_ms();
+  const size_t chunk_sz = 128 * 1024;
+  uint8_t *chunk = malloc(chunk_sz);
+  if (!chunk) {
+    return -1;
+  }
+  char cur[4096], next[4096];
+  snprintf(cur, sizeof(cur), "%s", url);
+  /* Release assets redirect to another host; follow by hand so each hop goes through the DNS bypass. */
+  for (int hop = 0;; hop++) {
+    rc = http_request_open(&se->ctx, cur, timeout_ms > 0 ? timeout_ms : 30000);
+    if (rc == 0) {
+      (void)sceHttpSetAutoRedirect(se->ctx.req_id, 0);
+      if ((rc = sceHttpSendRequest(se->ctx.req_id, 0, 0)) >= 0) {
+        rc = sceHttpGetStatusCode(se->ctx.req_id, &status);
+      }
+    }
+    int moved = status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+    if (rc >= 0 && moved && hop < 5 && http_response_location(&se->ctx, next, sizeof(next)) == 0) {
+      http_request_close(&se->ctx);
+      snprintf(cur, sizeof(cur), "%s", next);
+      continue;
+    }
+    break;
+  }
+  if (rc >= 0 && status == 200) {
+    fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0) {
+      rc = -1;
+    }
+    while (rc >= 0) {
+      long long t0 = mono_ms();
+      int n = sceHttpReadData(se->ctx.req_id, chunk, chunk_sz);
+      read_ms += mono_ms() - t0;
+      if (n < 0) {
+        rc = n;
+        break;
+      }
+      if (n == 0) {
+        rc = 0;
+        break;
+      }
+      long long t1 = mono_ms();
+      ssize_t wr = write(fd, chunk, (size_t)n);
+      write_ms += mono_ms() - t1;
+      if (wr != (ssize_t)n) {
+        rc = -1;
+        break;
+      }
+      total += (size_t)n;
+      if (pfn) {
+        pfn(total, 0, pud);
+      }
+    }
+    if (fd >= 0) {
+      close(fd);
+    }
+  }
+  http_request_close(&se->ctx);
+  free(chunk);
+  if (rc != 0 || status != 200) {
+    unlink(path);
+  }
+  se->last_read_ms = read_ms;
+  se->last_write_ms = write_ms;
+  se->last_total_ms = mono_ms() - begin_ms;
+  if (status_out) {
+    *status_out = status;
+  }
+  if (bytes_out) {
+    *bytes_out = total;
+  }
+  return rc < 0 ? rc : 0;
+}
+
+/* Timing split of the last http_session_download_file call. */
+void
+http_session_last_timing(http_session_t *se, long long *read_ms, long long *write_ms, long long *total_ms) {
+  *read_ms = se->last_read_ms;
+  *write_ms = se->last_write_ms;
+  *total_ms = se->last_total_ms;
 }

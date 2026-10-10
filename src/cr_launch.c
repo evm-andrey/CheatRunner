@@ -227,8 +227,8 @@ launch_title(uint64_t gen, const char *title_id, const char *args, const char **
     *fguser_out = has_ctx;
   }
 
-  /* Don't kill the current app here (launch worker already handles it, would race) -
-   * try LncUtil first since SystemService often 0x80940005s on non-standard titles. */
+  /* Do not kill the current app here (the launch worker does); try LncUtil first, since SystemService
+   * often returns 0x80940005 on non-standard titles. */
   lnc_rc = launch_title_with_lncutil(title_id, &ctx, has_ctx, argc > 0 ? argv_ptrs : NULL);
   if (rc_out) {
     *rc_out = lnc_rc;
@@ -238,8 +238,9 @@ launch_title(uint64_t gen, const char *title_id, const char *args, const char **
   }
   if (launch_rc_is_submitted_or_verifiable(lnc_rc)) {
     set_launch_status_ex_gen(gen, 1, "verifying_lnc", title_id, "Verifying launch...", 0, "sceLncUtilLaunchApp", lnc_rc, 0);
-    /* 0x80940005 on the LncUtil path caps the wait to 5s so we fall through to
-     * SystemService quickly; rc==0 (clean submit) still uses the full verify_timeout. */
+    // 0x80940005 on the LncUtil path: cap the wait to 5s so we fall through to
+    // SystemService quickly when the title never appears. rc==0 (clean submit)
+    // still uses the full verify_timeout.
     int lnc_verify_ms = ((uint32_t)lnc_rc == 0x80940005u)
                         ? (verify_timeout < 5000 ? verify_timeout : 5000)
                         : verify_timeout;
@@ -302,7 +303,7 @@ launch_title(uint64_t gen, const char *title_id, const char *args, const char **
   cr_log("error", "launch", "all launch methods failed %s lnc=%d (0x%08X) system=%d (0x%08X)",
          title_id, lnc_rc, (uint32_t)lnc_rc, sys_rc, (uint32_t)sys_rc);
 
-  /* Task 5: if both methods returned 0x80940005 do a final longer wait before giving up. */
+  /* Both launch methods can return 0x80940005 before the title appears. */
   if ((uint32_t)lnc_rc == 0x80940005u && (uint32_t)sys_rc == 0x80940005u) {
     cr_log("info", "launch", "final async verify %s for up to %dms after 0x80940005", title_id, verify_timeout);
     if (wait_until_title_running(title_id, verify_timeout) == 0) {
@@ -317,8 +318,7 @@ launch_title(uint64_t gen, const char *title_id, const char *args, const char **
     }
     cr_log("warn", "launch", "final verify timeout %s", title_id);
 
-    /* Task 2: immediate check — game_monitor may have detected the title
-       at the exact moment the verify timeout fired */
+    /* The monitor may detect the title just as the verification timeout expires. */
     {
       running_game_state_t gm_imm;
       running_state_get(&gm_imm);
@@ -331,7 +331,7 @@ launch_title(uint64_t gen, const char *title_id, const char *args, const char **
       }
     }
 
-    /* Task 2: grace window — poll game_monitor for up to launch_post_timeout_grace_ms */
+    /* Give the monitor a short grace window to detect the title. */
     {
       int grace_ms = 3000;
       pthread_mutex_lock(&g_cfg_lock);
@@ -552,8 +552,7 @@ launch_worker_thread(void *arg) {
   uint64_t my_gen = req.generation;
   set_launch_status_ex_gen(my_gen, 1, "killing_current", req.title_id, "Closing current game...", 0, "", 0, 0);
   cr_log("info", "launch", "request title=%s args=\"%s\"", req.title_id, req.args[0] ? req.args : "");
-  /* Verify with a live check before trusting the cache, which can be up to
-   * 500ms stale after a manual close. */
+  /* Verify with a live check before trusting the cache, which can be up to 500ms stale after a manual close. */
   {
     running_game_state_t cur;
     running_state_get(&cur);

@@ -89,12 +89,6 @@ cr_version_equal_known(const char *a, const char *b) {
 }
 
 int
-cr_version_is_known(const char *v) {
-  char n[32];
-  return cr_version_normalize(v, n, sizeof(n));
-}
-
-int
 cr_version_from_filename(const char *name, char *out, size_t out_sz) {
   if (!name || !out || out_sz < 2) return 0;
   out[0] = '\0';

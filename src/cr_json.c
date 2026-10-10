@@ -59,24 +59,6 @@ json_escape(const char *src) {
 }
 
 int
-parse_json_from_body(const char *body, cJSON **out_root) {
-  if (!out_root) {
-    return -1;
-  }
-  *out_root = NULL;
-  if (!body || !body[0]) {
-    return -1;
-  }
-  cJSON *root = cJSON_Parse(body);
-  if (!root || !cJSON_IsObject(root)) {
-    cJSON_Delete(root);
-    return -1;
-  }
-  *out_root = root;
-  return 0;
-}
-
-int
 json_extract_string(const char *json, const char *key, char *out, size_t out_size) {
   if (!json || !key || !out || out_size < 2) {
     return 0;

@@ -48,8 +48,7 @@ handle_api_launch_status(int fd) {
                              ? (long long)(now - ls_updated_ms) : 0;
   int stale = ls_busy && age_ms > 60000;
 
-  /* If launch ended in failure but the game is actually running,
-     report ready so the UI isn't stuck in a failed state. */
+  /* If the launch failed but the game is running, report ready so the UI is not stuck. */
   if (strcmp(ls_phase, "failed") == 0 && ls_title[0] != '\0') {
     running_game_state_t gm;
     running_state_get(&gm);

@@ -1,6 +1,4 @@
-/* ps5sdk_compat.h — PS5 SDK feature guards, ABI types, and function prototypes.
- * Include this before any main.c internals that reference SCE/sqlite APIs.
- */
+/* PS5 SDK feature guards, ABI types and prototypes. Include before main.c internals that use SCE/sqlite APIs. */
 #pragma once
 
 #include <stdint.h>
@@ -62,8 +60,8 @@ int sceKernelGetAppInfo(pid_t pid, app_info_t *info);
 int sceUserServiceInitialize(void *params);
 void sceUserServiceTerminate(void);
 int sceUserServiceGetForegroundUser(uint32_t *user_id);
+int sceUserServiceGetInitialUser(uint32_t *user_id);
 int sceUserServiceGetUserName(int32_t user_id, char *name, size_t size);
-int sceUserServiceSetUserName(int32_t user_id, const char *name);
 int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
 
 #if CHEATRUNNER_HAVE_SCE_USER_LIST

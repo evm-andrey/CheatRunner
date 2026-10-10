@@ -189,7 +189,7 @@ autoloadWorker(std::string titleId, pid_t pid, std::vector<std::string> entryIds
       if (rc == 0) {
         cr_log("info", "patch_profiles", "autoload: applied entry=%s title=%s",
                eid.c_str(), titleId.c_str());
-        usleep(500 * 1000); /* pace consecutive applies to match cheat_apply_cooldown_ms's default (cr_config.c) — patch_apply has no cooldown of its own */
+        usleep(1000 * 1000); /* patch_apply has no cooldown of its own */
         break;
       }
       bool permanent = !strcmp(err, "entry_not_found") || !strcmp(err, "no_supported_lines") ||
@@ -198,6 +198,7 @@ autoloadWorker(std::string titleId, pid_t pid, std::vector<std::string> entryIds
       if (permanent) {
         cr_log("warn", "patch_profiles", "autoload: entry=%s failed title=%s: %s",
                eid.c_str(), titleId.c_str(), err);
+        usleep(1000 * 1000);
         break;
       }
       usleep((useconds_t)kRetryMs * 1000);

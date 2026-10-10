@@ -23,8 +23,8 @@ notify_send_thread(void *arg) {
   return NULL;
 }
 
-/* Fire-and-forget on a detached thread - sceKernelSendNotificationRequest can stall
- * under rapid repeated calls, and notify() is often called while holding g_cheat_apply_lock. */
+/* Fire-and-forget on a detached thread: sceKernelSendNotificationRequest can stall under rapid calls,
+ * and notify() is often called while holding g_cheat_apply_lock. */
 void
 notify(const char *fmt, ...) {
   notify_request_t *req = malloc(sizeof(*req));

@@ -3,8 +3,8 @@
 
 #include <stddef.h>
 
-/* Canonical form: strip leading 'v'/'V', leading zeros, trailing .0 segments (e.g.
- * "v1.09.0" -> "1.9"). Returns 1 on success, 0 if empty/unparseable (out set to ""). */
+/* Canonical form: drop a leading 'v', leading zeros per segment and trailing .0 segments ("01.09.00" -> "1.9").
+ * Returns 1 on success, 0 if the input is empty/unparseable (out is set to ""). */
 int cr_version_normalize(const char *in, char *out, size_t out_sz);
 
 /* 1 if a and b represent the same version (after normalization), 0 otherwise. */
@@ -17,7 +17,6 @@ int cr_version_compare(const char *a, const char *b);
 int cr_version_equal_known(const char *a, const char *b);
 
 /* 1 if the input normalizes to at least one numeric segment. */
-int cr_version_is_known(const char *v);
 
 /* Extract version token after the first '_' in a cheat filename.
  * "CUSA00900_01.09.json" → "01.09".  Returns 1 on success, 0 if not found. */

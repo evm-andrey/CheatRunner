@@ -162,6 +162,7 @@ private:
 void
 autoloadWorker(std::string titleId, pid_t pid, std::vector<std::string> mods) {
   const int kRetryMs = 1000;
+  const int kPaceMs = 1000; /* gap after every toggle */
   const uint64_t kDeadlineMs = 45000;
   uint64_t started = now_ms();
 
@@ -196,12 +197,14 @@ autoloadWorker(std::string titleId, pid_t pid, std::vector<std::string> mods) {
       int rc = apply_cheat_json(titleId.c_str(), idx, 1, err, sizeof(err));
       if (rc == 0) {
         cr_log("info", "cheat_profiles", "autoload: enabled '%s' title=%s", name.c_str(), titleId.c_str());
+        usleep((useconds_t)kPaceMs * 1000);
         break;
       }
       bool retryable = (rc == -2) || !strcmp(err, "app_not_stable");
       if (!retryable) {
         cr_log("warn", "cheat_profiles", "autoload: mod '%s' failed title=%s: %s",
                name.c_str(), titleId.c_str(), err);
+        usleep((useconds_t)kPaceMs * 1000);
         break;
       }
       usleep((useconds_t)kRetryMs * 1000);

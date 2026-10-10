@@ -29,7 +29,7 @@ static void etaHEN_log(const char *fmt, ...) {
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
-  cr_log("info", "mc4", "%s", buf);
+  cr_log("debug", "mc4", "%s", buf);
 }
 
 uint8_t* decrypt_data(uint8_t* data, size_t* size)

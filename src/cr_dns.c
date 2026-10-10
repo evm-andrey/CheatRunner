@@ -11,8 +11,7 @@
 
 #include "cr_dns.h"
 
-/* Process-lifetime DNS cache - avoids re-resolving the same hostname thousands of
- * times. Entries never expire; the IPs we query stay stable across a session. */
+/* Process-lifetime DNS cache. GitHub IPs are stable within a download session, so entries never expire. */
 #define DNS_CACHE_MAX 16
 typedef struct { char host[128]; char ip[64]; } dns_cache_entry_t;
 static dns_cache_entry_t g_dns_cache[DNS_CACHE_MAX];
@@ -137,8 +136,7 @@ cr_dns_resolve(const char *hostname, char *ip_out, size_t ip_out_sz) {
         dns_addr.sin_port        = htons(53);
         dns_addr.sin_addr.s_addr = inet_addr(dns_servers[si]);
 
-        /* connect() makes the kernel drop any reply not actually from this
-         * server/port instead of accepting a spoofed datagram from anyone. */
+        /* connect() makes the kernel drop replies that do not come from this server/port. */
         if (connect(sock, (struct sockaddr *)&dns_addr, sizeof(dns_addr)) != 0) {
             close(sock);
             continue;

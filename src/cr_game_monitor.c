@@ -6,13 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
-#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <ps5/kernel.h>
 
-#include "cr_addr_cache.h"
 #include "cr_cheat_profiles.h"
 #include "cr_cheats.h"
 #include "cr_patch_profiles.h"
@@ -200,8 +198,8 @@ read_running_state(running_game_state_t *out) {
     snprintf(st.title_name, sizeof(st.title_name), "%s", title);
   }
   /* Probe patch0 (update), then app0, then /app0, then static paths; PS5 updates mount as patch0, not user/patch/. */
-  /* Cache version per pid - re-reading /proc/{pid}/root/... on a frozen game (cave
-   * cheat strips WRITE) blocks the thread in kernel VFS indefinitely, hanging the daemon. */
+  /* Cache the version per pid: re-reading /proc/<pid>/root of a frozen game (cave cheats strip WRITE)
+   * blocks in kernel VFS and can hang the daemon. */
   static pthread_mutex_t ver_cache_lock = PTHREAD_MUTEX_INITIALIZER;
   static pid_t ver_cache_pid = -1;
   static char  ver_cache_cv[32];
@@ -243,8 +241,7 @@ read_running_state(running_game_state_t *out) {
       read_param_value_by_title_id(title, "contentVersion", st.content_version, sizeof(st.content_version));
     if (!st.app_version[0])
       read_param_value_by_title_id(title, "appVersion", st.app_version, sizeof(st.app_version));
-    /* Last resort: scan /user/appmeta for the real content ID → sandbox path.
-     * This is the slowest path (directory listing) — only runs when all else fails. */
+    /* Last resort and the slowest: scan /user/appmeta for the content ID to find the sandbox path. */
     if (!st.content_version[0] && !st.app_version[0])
       read_param_value_from_appmeta(title, "contentVersion", st.content_version, sizeof(st.content_version));
     if (!st.content_version[0] && !st.app_version[0])
@@ -336,14 +333,12 @@ rpc_refresh_title_and_notify(void) {
   if (read_running_state(&cur) != 0) {
     memset(&cur, 0, sizeof(cur));
   }
-  /* If the BigApp syscall still reports running but the pid is dead, treat as stopped.
-   * This catches crashes that the PS5 firmware hasn't cleaned up yet. */
+  /* BigApp says running but the pid is dead: treat it as stopped (a crash the firmware has not cleaned up). */
   if (cur.running && cur.pid > 0 && kill(cur.pid, 0) != 0 && errno == ESRCH) {
     cr_log("info", "game", "pid %d is dead (kill probe failed) — forcing game_stopped", (int)cur.pid);
     memset(&cur, 0, sizeof(cur));
   }
-  /* Carry forward already-detected version when the same game/pid is still running.
-   * Avoids re-probing the same param.json / param.sfo files every 500 ms poll tick. */
+  /* Reuse the detected version while the same game/pid runs, so param files are not re-read every poll. */
   if (cur.running && prev.running && cur.pid == prev.pid &&
       strcmp(cur.title_id, prev.title_id) == 0) {
     if (!cur.content_version[0] && prev.content_version[0])
@@ -400,16 +395,6 @@ rpc_refresh_title_and_notify(void) {
         pthread_mutex_unlock(&g_crash_guard_lock);
         if (just_suspected) {
           crash_suspects_save();
-          /* Clear addr_cache for the suspected title so the same unverified
-           * address is not reused on the next launch, repeating the crash. */
-          char _susp_path[256]; int _susp_kind = 0;
-          if (find_cheat_file_for_title(prev.title_id, _susp_path,
-                                        sizeof(_susp_path), &_susp_kind)) {
-            addr_cache_clear_for_path(_susp_path);
-            cr_log("info", "addr_cache",
-                   "cleared for crash_suspect title=%s path=%s",
-                   prev.title_id, _susp_path);
-          }
         }
 
         pthread_mutex_lock(&g_mods_disabled_lock);
@@ -420,7 +405,7 @@ rpc_refresh_title_and_notify(void) {
         }
         pthread_mutex_unlock(&g_mods_disabled_lock);
         mod_enabled_clear_for_pid(prev.pid);
-        /* Skip restore mid-apply: it shares g_cheat_apply_lock with apply and would stall the monitor poll until apply releases it. */
+        /* Skip the restore mid-apply: it shares g_cheat_apply_lock and would stall the monitor poll. */
         if (!g_cheat_applying) {
           patch_restore_all_for_pid(prev.pid, prev.title_id);
         }
@@ -459,7 +444,6 @@ rpc_refresh_title_and_notify(void) {
       notification_add("game_started", "Game started: %s", cur.title_id);
       cr_log("info", "game", "game started %s", cur.title_id);
       launch_status_recover_for_game(cur.title_id);
-      addr_cache_clear_for_title(cur.title_id);
       autoload_profiles_for_title(cur.title_id, cur.pid);
     }
   }
@@ -525,7 +509,6 @@ rpc_refresh_title_and_notify(void) {
 void *
 game_monitor_thread(void *arg) {
   (void)arg;
-  syscall(SYS_thr_set_name, -1, "CheatRunner.elf");
   time_t last_save = 0;
   while (g_game_monitor_running) {
     rpc_refresh_title_and_notify();

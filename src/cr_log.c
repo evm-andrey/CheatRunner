@@ -3,14 +3,16 @@
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 #include "cr_log.h"
 #include "cr_paths.h"
+#include "build_id.h"
 
-/* sendsyslog (syscall 0x259) -> klogsrv reads /dev/klog. The <118> prefix
- * is syslog priority (facility=kernel, severity=info). */
+/* Writes to klogsrv through sendsyslog (syscall 0x259); the <118> prefix is the syslog priority
+ * (kernel, info). */
 static void
 klog_raw(const char *buf) {
   syscall(0x259, 7, buf, 0);
@@ -43,25 +45,53 @@ klog_send(const char *level, const char *tag, const char *msg) {
   }
 }
 
-/* Plain-text session log at CHEATRUNNER_LOG_PATH - opened once (truncating any
- * previous session's file), appended to for the process lifetime. Caller holds g_log_lock. */
+/* Plain-text log at CHEATRUNNER_LOG_PATH, appended to across sessions. Each session starts
+ * with a header line, and a file over 2 MB is moved to ".previous". Caller must hold g_log_lock. */
+#define LOG_FILE_MAX_BYTES (2 * 1024 * 1024)
 static FILE *g_log_file = NULL;
 
+static FILE *
+log_file_open(void) {
+    struct stat st;
+    if (stat(CHEATRUNNER_LOG_PATH, &st) == 0 && st.st_size > LOG_FILE_MAX_BYTES) {
+        char previous[sizeof(CHEATRUNNER_LOG_PATH) + 16];
+        snprintf(previous, sizeof(previous), "%s.previous", CHEATRUNNER_LOG_PATH);
+        rename(CHEATRUNNER_LOG_PATH, previous);
+    }
+    FILE *f = fopen(CHEATRUNNER_LOG_PATH, "a");
+    if (f) {
+        fprintf(f, "\n--- CheatRunner %s (build %s) session pid=%d ---\n", CHEATRUNNER_VERSION, CHEATRUNNER_BUILD_ID, (int)getpid());
+        fflush(f);
+    }
+    return f;
+}
+
 static void
-log_file_write_locked(const char *level, const char *tag, const char *message, time_t ts) {
-  if (!g_log_file) {
-    /* /data/cheatrunner may not exist yet this early in boot (ensure_data_dirs() runs
-     * after several log lines) - keep retrying instead of giving up after one failure. */
-    g_log_file = fopen(CHEATRUNNER_LOG_PATH, "w");
-  }
-  if (!g_log_file) {
-    return;
-  }
+log_file_line(FILE *f, const char *level, const char *tag, const char *message, time_t ts) {
   struct tm tmv;
   char tbuf[24];
   localtime_r(&ts, &tmv);
   strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tmv);
-  fprintf(g_log_file, "%s [%s] [%s] %s\n", tbuf, level, tag, message);
+  fprintf(f, "%s [%s] [%s] %s\n", tbuf, level, tag, message);
+}
+
+static void
+log_file_write_locked(const char *level, const char *tag, const char *message, time_t ts) {
+  if (!g_log_file) {
+    /* /data/cheatrunner may not exist this early in boot; keep retrying instead of giving up for the session. */
+    g_log_file = log_file_open();
+    if (g_log_file) {
+      /* Lines logged before the file could be opened; the newest entry is the one being written. */
+      for (int i = 0; i < g_log_count - 1; i++) {
+        const log_entry_t *e = &g_logs[(g_log_start + i) % MAX_LOG_ENTRIES];
+        log_file_line(g_log_file, e->level, e->tag, e->message, e->ts);
+      }
+    }
+  }
+  if (!g_log_file) {
+    return;
+  }
+  log_file_line(g_log_file, level, tag, message, ts);
   fflush(g_log_file);
 }
 
@@ -70,7 +100,7 @@ log_entry_t     g_logs[MAX_LOG_ENTRIES];
 int             g_log_start = 0;
 int             g_log_count = 0;
 int             g_log_next_seq = 0;
-static volatile int g_log_min_level = CR_LOG_LEVEL_INFO;
+static volatile int g_log_min_level = CR_LOG_LEVEL_DEBUG;
 
 static int
 log_level_from_string(const char *level) {
@@ -90,17 +120,6 @@ log_level_from_string(const char *level) {
     return CR_LOG_LEVEL_ERROR;
   }
   return CR_LOG_LEVEL_INFO;
-}
-
-static const char *
-log_level_to_string(int level) {
-  switch (level) {
-  case CR_LOG_LEVEL_DEBUG: return "debug";
-  case CR_LOG_LEVEL_INFO: return "info";
-  case CR_LOG_LEVEL_WARN: return "warn";
-  case CR_LOG_LEVEL_ERROR: return "error";
-  default: return "info";
-  }
 }
 
 void
@@ -136,11 +155,6 @@ log_push(const char *level, const char *tag, const char *message) {
 void
 cr_log_set_level(const char *level) {
   g_log_min_level = log_level_from_string(level);
-}
-
-const char *
-cr_log_get_level(void) {
-  return log_level_to_string(g_log_min_level);
 }
 
 int

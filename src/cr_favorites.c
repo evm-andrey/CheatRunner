@@ -18,8 +18,7 @@ static char g_recent[RECENT_MAX][ID_LEN];
 static int  g_recent_n = 0;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Title IDs are short alphanumerics (e.g. PPSA12345 / CUSA00004). Reject anything
- * else so a malformed request can't poison the persisted file. */
+/* Title IDs are short alphanumerics; reject anything else so a bad request cannot poison the file. */
 static int
 id_ok(const char *id) {
   if (!id || !id[0]) return 0;
@@ -121,7 +120,6 @@ handle_api_favorites_set(int fd, const char *query) {
   if (on) {
     if (idx < 0 && g_fav_n < FAV_MAX) { snprintf(g_fav[g_fav_n], ID_LEN, "%s", id); g_fav_n++; }
   } else if (idx >= 0) {
-    /* swap-remove */
     if (idx != g_fav_n - 1) snprintf(g_fav[idx], ID_LEN, "%s", g_fav[g_fav_n - 1]);
     g_fav_n--;
   }
@@ -138,7 +136,6 @@ handle_api_favorites_recent(int fd, const char *query) {
     return;
   }
   pthread_mutex_lock(&g_lock);
-  /* Drop any existing copy (compacting the array). */
   int w = 0;
   for (int i = 0; i < g_recent_n; i++) {
     if (strcmp(g_recent[i], id) != 0) {
@@ -147,7 +144,6 @@ handle_api_favorites_recent(int fd, const char *query) {
     }
   }
   g_recent_n = w;
-  /* Make room at the front, capping the list. */
   if (g_recent_n >= RECENT_MAX) g_recent_n = RECENT_MAX - 1;
   for (int i = g_recent_n; i > 0; i--) snprintf(g_recent[i], ID_LEN, "%s", g_recent[i - 1]);
   snprintf(g_recent[0], ID_LEN, "%s", id);

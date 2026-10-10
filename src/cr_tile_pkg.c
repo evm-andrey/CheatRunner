@@ -14,7 +14,7 @@
 #include "jb.h"
 
 /* ----------------------------------------------------------------------- */
-/* sceAppInstUtil ABI — identical to elf-arsenal's struct layout           */
+/* sceAppInstUtil ABI structs. */
 
 #define HB_CONTENTID_SIZE        0x30
 #define HB_PLAYGOSCENARIOID_SIZE 3
@@ -70,7 +70,7 @@ extern int sceAppInstUtilAppInstallPkg(const char        *path,
 
 static int
 install_pkg_at_path(const char *path) {
-  /* Initialize once — repeated calls reset IPMI state (elf-arsenal note). */
+  /* Initialize once: repeated calls reset the IPMI state. */
   static pthread_mutex_t ai_mtx  = PTHREAD_MUTEX_INITIALIZER;
   static int             ai_done = 0;
   pthread_mutex_lock(&ai_mtx);
@@ -114,7 +114,6 @@ install_pkg_at_path(const char *path) {
 static void *
 tile_autoinstall_thread(void *arg) {
   (void)arg;
-  syscall(SYS_thr_set_name, -1, "cr-tile-inst");
 
 #ifndef CHEATRUNNER_HAVE_TILE_PKG
   cr_log("info", "tile_pkg", "no embedded PKG at build time — skipping");
@@ -128,8 +127,8 @@ tile_autoinstall_thread(void *arg) {
     return NULL;
   }
 
-  /* Already installed — avoid triggering AppPrepareOverwriteByPackage every
-   * boot (that crashes SceShellCore's SceAppInstallerJobQueue on some FWs). */
+  /* Already installed: skip, since AppPrepareOverwriteByPackage on every boot crashes the SceShellCore
+   * installer queue on some firmwares. */
   struct stat st;
   if (stat(TILE_APPMETA, &st) == 0) {
     cr_log("info", "tile_pkg", TILE_TITLE_ID " already installed, skipping");
@@ -140,8 +139,7 @@ tile_autoinstall_thread(void *arg) {
   notify("CheatRunner: installing PKG...");
   cr_log("info", "tile_pkg", "tile not yet installed — starting install");
 
-  /* 3s lets SceShellCore's installer queue settle - only a cold first-boot
-   * needs elf-arsenal's full 30s. */
+  /* 3 s lets the SceShellCore installer queue settle; only a cold first boot needs the full 30 s. */
   sleep(3);
 
   if (jb_escalate_pid(getpid()) != 0) {

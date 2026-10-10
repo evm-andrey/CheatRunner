@@ -19,8 +19,8 @@ typedef struct {
     int             mod_count;
 } cheat_conflict_map_t;
 
-/* Build conflict map from parsed JSON text - compares every mod pair for
- * overlapping address ranges. Returns 0 on success, -1 on parse error. */
+/* Builds the conflict map from parsed JSON text by comparing mod pairs for overlapping offset
+ * ranges. Returns 0 on success, -1 on parse error. */
 int  conflict_map_build(const char *json_text, cheat_conflict_map_t *out);
 
 /* Returns list of mod indices that conflict with mod_idx; returns count. */

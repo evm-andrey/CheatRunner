@@ -428,6 +428,7 @@ read_param_value_by_title_id(const char *title_id, const char *key, char *out, s
       "/user/appmeta/%s/param.json",
       "/user/appmeta/%s/sce_sys/param.json",
       "/user/app/%s/sce_sys/param.json",
+      "/system_ex/app/%s/sce_sys/param.json",   /* Folders mounted with nullfs (homebrew) */
       NULL,
   };
   const char *sfo_candidates[] = {
@@ -441,6 +442,7 @@ read_param_value_by_title_id(const char *title_id, const char *key, char *out, s
       "/user/appmeta/external/%s/param.sfo",
       "/user/appmeta/external/%s/sce_sys/param.sfo",
       "/user/app/%s/sce_sys/param.sfo",
+      "/system_ex/app/%s/sce_sys/param.sfo",
       "/mnt/ext0/user/patch/%s/sce_sys/param.sfo",
       "/mnt/ext1/user/patch/%s/sce_sys/param.sfo",
       "/mnt/ext0/user/app/%s/sce_sys/param.sfo",

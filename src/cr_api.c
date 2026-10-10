@@ -21,6 +21,8 @@
 #include "priv_bootstrap.h"
 #include "pt.h"
 #include "third_party/cJSON.h"
+#include "third_party/stb_image.h"
+#include "third_party/stb_image_write.h"
 #include "cr_log.h"
 #include "cr_paths.h"
 #include "cr_config.h"
@@ -39,11 +41,22 @@
 #include "cr_patch_profiles.h"
 #include "cr_patch_parser.h"
 #include "cr_http.h"
-#include "cr_remote_sources.h"
-#include "cr_source_jobs.h"
 #include "cr_repo_mirror.h"
 #include "cr_api.h"
 #include "cr_api_internal.h"
+
+/* The dashboard polls cheat state every few seconds; its per-mod diagnostics are logged about once a minute. */
+static __thread int t_state_verbose;
+
+static int
+state_log_due(void) {
+  static time_t last;
+  time_t now = time(NULL);
+  if (now - last < 60) return 0;
+  last = now;
+  return 1;
+}
+
 #include "cr_conflict.h"
 #include "cr_api_dashboard.h"
 #include "cr_api_games.h"
@@ -54,8 +67,6 @@
 #include "cr_api_sources.h"
 #include "cr_api_dev.h"
 #include "cr_api_logs.h"
-#include "cr_fan.h"
-#include "cr_profile.h"
 #include "cr_shutdown.h"
 #include "cr_store_lookup.h"
 #include "http_client.h"
@@ -64,7 +75,7 @@
 #endif
 
 #ifndef CHEATRUNNER_VERSION
-#define CHEATRUNNER_VERSION "0.17.1"
+#define CHEATRUNNER_VERSION "0.18"
 #endif
 
 #define MAX_GAMES CR_APPDB_MAX_GAMES
@@ -438,8 +449,6 @@ handle_api_health(int fd) {
   int games_busy = g_games_scan_busy;
   pthread_mutex_unlock(&g_games_cache_lock);
 
-  int source_busy = cr_source_jobs_is_busy();
-
   pthread_mutex_lock(&g_repo_mirror.lock);
   int mirror_busy = (g_repo_mirror.state == REPO_MIRROR_RUNNING);
   pthread_mutex_unlock(&g_repo_mirror.lock);
@@ -466,12 +475,11 @@ handle_api_health(int fd) {
   char buf[640];
   snprintf(buf, sizeof(buf),
            "{\"ok\":true,\"version\":\"%s\",\"uptimeMs\":%lld,"
-           "\"busy\":{\"gamesScan\":%s,\"sourceJob\":%s,\"repoMirror\":%s,\"launch\":%s},"
+           "\"busy\":{\"gamesScan\":%s,\"repoMirror\":%s,\"launch\":%s},"
            "\"launch\":{\"busy\":%s,\"phase\":\"%s\",\"titleId\":\"%s\",\"ageMs\":%lld,\"stale\":%s},"
            "\"http\":{\"activeClients\":%d,\"maxConcurrent\":%d,\"tooManyRequestsCount\":%lld}}",
            CHEATRUNNER_VERSION, uptime,
            games_busy        ? "true" : "false",
-           source_busy       ? "true" : "false",
            mirror_busy       ? "true" : "false",
            ls_health_busy    ? "true" : "false",
            ls_health_busy    ? "true" : "false",
@@ -731,7 +739,7 @@ handle_api_state(int fd) {
   pthread_mutex_unlock(&g_activity_lock);
   char *name_esc = json_escape(rs.title_name);
   char *last_esc = json_escape(last_local);
-  /* Pre-compute cheatFormat JSON value once — avoids the old double-build. */
+  /* Build the cheatFormat value once. */
   char cheat_format_field[16];
   if (has_cheat) snprintf(cheat_format_field, sizeof(cheat_format_field), "\"%s\"", cheat_fmt);
   else           strcpy(cheat_format_field, "null");
@@ -740,7 +748,7 @@ handle_api_state(int fd) {
   if (rs.running) {
     snprintf(
         body, sizeof(body),
-        "{\"ok\":true,\"version\":\"%s\",\"psFwVersion\":\"%s\",\"browserUrl\":\"http://%s:%d/\",\"httpPort\":%d,"
+        "{\"ok\":true,\"version\":\"%s\",\"browserUrl\":\"http://%s:%d/\",\"httpPort\":%d,"
         "\"cheatSource\":\"local\",\"running\":{\"running\":true,\"titleId\":\"%s\",\"titleName\":\"%s\","
         "\"platform\":\"%s\",\"appId\":\"0x%X\",\"pid\":%d,\"imageBase\":\"0x%lx\",\"contentVersion\":\"%s\","
         "\"appVersion\":\"%s\",\"startedAt\":%llu,\"hasCheat\":%s,\"cheatFormat\":%s},"
@@ -748,7 +756,7 @@ handle_api_state(int fd) {
         "\"config\":{\"autoLoadCheatMenu\":%s,"
         "\"autoDownloadMissingCheat\":%s,\"allowForceEnable\":%s,\"cheatStateAfterLaunchDelayMs\":%d},"
         "\"dev\":{\"reloadEnabled\":%s,\"shutdownDelayMs\":%d}}",
-        CHEATRUNNER_VERSION, cr_fw_version_string(), g_listen_ip, http_port, http_port, rs.title_id, name_esc ? name_esc : rs.title_name,
+        CHEATRUNNER_VERSION, g_listen_ip, http_port, http_port, rs.title_id, name_esc ? name_esc : rs.title_name,
         rs.platform, rs.app_id, (int)rs.pid, (long)rs.image_base, rs.content_version, rs.app_version,
         (unsigned long long)rs.started_at, has_cheat ? "true" : "false",
         cheat_format_field, cheat_engine ? "true" : "false", last_esc ? last_esc : "", local_count,
@@ -758,13 +766,13 @@ handle_api_state(int fd) {
   } else {
     snprintf(
         body, sizeof(body),
-        "{\"ok\":true,\"version\":\"%s\",\"psFwVersion\":\"%s\",\"browserUrl\":\"http://%s:%d/\",\"httpPort\":%d,"
+        "{\"ok\":true,\"version\":\"%s\",\"browserUrl\":\"http://%s:%d/\",\"httpPort\":%d,"
         "\"cheatSource\":\"local\",\"running\":{\"running\":false},"
         "\"cheats\":{\"engine\":%s,\"activeCount\":0,\"lastApplied\":\"%s\",\"localCount\":%d,\"canPatchGameMemory\":%s},"
         "\"config\":{\"autoLoadCheatMenu\":%s,"
         "\"autoDownloadMissingCheat\":%s,\"allowForceEnable\":%s,\"cheatStateAfterLaunchDelayMs\":%d},"
         "\"dev\":{\"reloadEnabled\":%s,\"shutdownDelayMs\":%d}}",
-        CHEATRUNNER_VERSION, cr_fw_version_string(), g_listen_ip, http_port, http_port, cheat_engine ? "true" : "false",
+        CHEATRUNNER_VERSION, g_listen_ip, http_port, http_port, cheat_engine ? "true" : "false",
         last_esc ? last_esc : "", local_count, can_patch ? "true" : "false",
         auto_load ? "true" : "false", auto_download ? "true" : "false",
         allow_force_enable ? "true" : "false", cheat_state_delay_ms, dev_reload_enabled ? "true" : "false",
@@ -830,9 +838,11 @@ build_games_json_array(char *buf, size_t cap, int debug_names) {
     char ver[32] = "";
     char content_id[96] = "";
     char icon_path[512];
+    char pic0_path[512];
     char cheat_path[256];
     int cheat_kind = 0;
     int has_icon = resolve_icon_path(entries[i].title_id, icon_path, sizeof(icon_path)) == 0;
+    int has_pic0 = resolve_pic0_path(entries[i].title_id, pic0_path, sizeof(pic0_path)) == 0;
     int has_cheat = find_cheat_file_for_title(entries[i].title_id, cheat_path, sizeof(cheat_path), &cheat_kind);
     char patch_xml_path[256] = "";
     int has_patch = (patch_find_xml_for_title(entries[i].title_id, patch_xml_path, sizeof(patch_xml_path)) == 0);
@@ -844,6 +854,8 @@ build_games_json_array(char *buf, size_t cap, int debug_names) {
     const char *cheat_fmt = has_cheat ? (cheat_kind == 1 ? "json" : (cheat_kind == 2 ? "shn" : "mc4")) : "";
     if (read_param_value_by_title_id(entries[i].title_id, "contentVersion", ver, sizeof(ver)) != 0)
       read_param_value_by_title_id(entries[i].title_id, "appVersion", ver, sizeof(ver));
+    if (!ver[0])
+      read_param_value_from_appmeta(entries[i].title_id, "contentVersion", ver, sizeof(ver));
     if (entries[i].content_id[0])
       snprintf(content_id, sizeof(content_id), "%s", entries[i].content_id);
     else
@@ -856,14 +868,14 @@ build_games_json_array(char *buf, size_t cap, int debug_names) {
         buf + off, cap - off,
         "%s{\"titleId\":\"%s\",\"titleName\":\"%s\",\"platform\":\"%s\",\"kind\":\"%s\",\"isApp\":%s,"
         "\"version\":\"%s\","
-        "\"contentId\":\"%s\",\"icon\":%s,\"iconUrl\":\"/appdb/icon?id=%s\","
-        "\"hasCheat\":%s,\"cheatFormat\":\"%s\",\"hasPatch\":%s,\"running\":%s,"
+        "\"contentId\":\"%s\",\"icon\":%s,\"iconUrl\":\"/appdb/icon?id=%s\",\"pic0\":%s,"
+        "\"pic0Url\":\"/appdb/pic0?id=%s\",\"hasCheat\":%s,\"cheatFormat\":\"%s\",\"hasPatch\":%s,\"running\":%s,"
         "\"autoloadCheats\":%s,\"autoloadPatches\":%s,"
         "\"playTime\":%llu,\"lastAccessTime\":%llu",
         emitted == 0 ? "" : ",", entries[i].title_id, name_esc, platform,
         is_app ? "app" : "game", is_app ? "true" : "false",
         ver_esc ? ver_esc : "unknown", cid_esc ? cid_esc : "",
-        has_icon ? "true" : "false", entries[i].title_id,
+        has_icon ? "true" : "false", entries[i].title_id, has_pic0 ? "true" : "false", entries[i].title_id,
         has_cheat ? "true" : "false", cheat_fmt, has_patch ? "true" : "false", running ? "true" : "false",
         autoload_cheats ? "true" : "false", autoload_patches ? "true" : "false",
         (unsigned long long)entries[i].play_time_seconds,
@@ -931,6 +943,7 @@ handle_api_games(int fd, const char *query) {
 
   char refresh_q[8] = {0};
   int force_refresh = (query_value(query, "refresh", refresh_q, sizeof(refresh_q)) == 0 && atoi(refresh_q) != 0);
+  if (force_refresh) patch_index_invalidate();
   const int refresh_min_interval_ms = 5000;
   int ttl_ms = 30000;
   pthread_mutex_lock(&g_cfg_lock);
@@ -1117,6 +1130,65 @@ handle_api_titles_lookup(int fd, const char *query) {
   handle_appdb_lookup(fd, query);
 }
 
+static void
+jpg_append(void *ctx, void *data, int size) {
+  FILE *f = ctx;
+  fwrite(data, 1, (size_t)size, f);
+}
+
+/* Box-downscales the 512px icon to 256px JPEG (about 20 KB), cached next to the PNG. */
+static int
+icon_thumb_ensure(const char *png_path, char *out, size_t out_sz) {
+  struct stat st;
+  snprintf(out, out_sz, "%s.t.jpg", png_path);
+  if (stat(out, &st) == 0 && st.st_size > 0) {
+    return 0;
+  }
+  uint8_t *buf = NULL;
+  size_t len = 0;
+  if (read_file_bytes(png_path, &buf, &len) != 0) {
+    return -1;
+  }
+  int w = 0, h = 0, n = 0;
+  uint8_t *px = stbi_load_from_memory(buf, (int)len, &w, &h, &n, 3);
+  free(buf);
+  if (!px) {
+    return -1;
+  }
+  int f = w / 256;
+  int rc = -1;
+  if (f >= 2 && h / f > 0) {
+    int tw = w / f, th = h / f;
+    uint8_t *small = malloc((size_t)tw * th * 3);
+    if (small) {
+      for (int y = 0; y < th; y++) {
+        for (int x = 0; x < tw; x++) {
+          for (int c = 0; c < 3; c++) {
+            int sum = 0;
+            for (int dy = 0; dy < f; dy++) {
+              for (int dx = 0; dx < f; dx++) {
+                sum += px[(((size_t)y * f + dy) * w + (size_t)x * f + dx) * 3 + c];
+              }
+            }
+            small[((size_t)y * tw + x) * 3 + c] = (uint8_t)(sum / (f * f));
+          }
+        }
+      }
+      char tmp[560];
+      snprintf(tmp, sizeof(tmp), "%s.tmp", out);
+      FILE *fp = fopen(tmp, "wb");
+      if (fp) {
+        int ok = stbi_write_jpg_to_func(jpg_append, fp, tw, th, 3, small, 85);
+        fclose(fp);
+        rc = (ok && rename(tmp, out) == 0) ? 0 : -1;
+      }
+      free(small);
+    }
+  }
+  stbi_image_free(px);
+  return rc;
+}
+
 void
 handle_appdb_icon(int fd, const char *query) {
   char title_id[32] = {0};
@@ -1131,6 +1203,17 @@ handle_appdb_icon(int fd, const char *query) {
   if (cache_media_ensure(norm_id, 0, path, sizeof(path)) != 0 || read_file_bytes(path, &buf, &len) != 0) {
     http_send_json(fd, 404, "{\"ok\":false,\"error\":\"no icon\"}");
     return;
+  }
+  char thumb[560], flag[4];
+  if (query_value(query, "t", flag, sizeof(flag)) == 0 && icon_thumb_ensure(path, thumb, sizeof(thumb)) == 0) {
+    uint8_t *tb = NULL;
+    size_t tl = 0;
+    if (read_file_bytes(thumb, &tb, &tl) == 0) {
+      http_send_response_cached(fd, 200, "image/jpeg", tb, tl);
+      free(tb);
+      free(buf);
+      return;
+    }
   }
   http_send_response_cached(fd, 200, "image/png", buf, len);
   free(buf);
@@ -1367,7 +1450,8 @@ handle_api_cheats_get(int fd, const char *query) {
   free(out);
 }
 
-/* Single-slot decoded-JSON cache keyed by (title_id, path, mtime, kind); avoids re-decrypting MC4/SHN on every state poll. */
+/* Single-slot cache of the decoded JSON, keyed by (title_id, path, mtime, kind),
+ * so state polls do not re-decrypt MC4/SHN. */
 static struct {
   pthread_mutex_t lock;
   char title_id[10];
@@ -1386,8 +1470,7 @@ static struct {
   int                ready;
 } g_conflict_cache = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
-/* Rebuild g_conflict_cache if the cheat file changed.
- * Must be called after the doc cache has been loaded (we borrow the cached JSON). */
+/* Rebuild g_conflict_cache when the cheat file changes; needs the doc cache loaded first. */
 static void
 conflict_cache_ensure(const char *path, time_t mtime) {
   /* Check+build under one lock so two concurrent callers can't both double-build (and leak entries_p). */
@@ -1421,7 +1504,7 @@ conflict_cache_ensure(const char *path, time_t mtime) {
       g_conflict_cache.mtime = mtime;
       g_conflict_cache.ready = 1;
       snprintf(g_conflict_cache.path, sizeof(g_conflict_cache.path), "%s", path);
-      cr_log("info", "conflicts",
+      cr_log("debug", "conflicts",
              "conflict map built path=%s mods=%d pairs=%d",
              path, tmp.mod_count, tmp.pair_count);
     }
@@ -1661,7 +1744,8 @@ handle_api_cheats_state(int fd, const char *query) {
     http_send_json(fd, 404, body);
     return;
   }
-  cr_log("debug", "cheats", "state request title=%s debug=%d", title_id, debug_mode);
+  t_state_verbose = state_log_due();
+  if (t_state_verbose) cr_log("debug", "cheats", "state request title=%s debug=%d", title_id, debug_mode);
   cJSON *mods = cJSON_GetObjectItem(root, "mods");
   if (!cJSON_IsArray(mods)) {
     cJSON_Delete(root);
@@ -1677,14 +1761,8 @@ handle_api_cheats_state(int fd, const char *query) {
   int attach_ok = 0;
   int is_ps2_st = 0;
   int global_state_delay_ms = 0;
-  int auto_detect = 1;
-  char mc4_fb_s[16] = "legacy";
-  char shn_fb_s[16] = "legacy";
   pthread_mutex_lock(&g_cfg_lock);
   global_state_delay_ms = g_cfg.cheat_state_after_launch_delay_ms;
-  auto_detect = g_cfg.cheat_address_auto_detect;
-  snprintf(mc4_fb_s, sizeof(mc4_fb_s), "%s", g_cfg.cheat_mc4_unverified_fallback);
-  snprintf(shn_fb_s, sizeof(shn_fb_s), "%s", g_cfg.cheat_shn_unverified_fallback);
   pthread_mutex_unlock(&g_cfg_lock);
   int in_loading_window = 0;
   {
@@ -1697,7 +1775,7 @@ handle_api_cheats_state(int fd, const char *query) {
     }
   }
   int can_probe = title_match && pid > 0 && base != 0 && !in_loading_window;
-  if (running_ok) {
+  if (running_ok && t_state_verbose) {
     cr_log("debug", "cheats", "running title=%s pid=%d base=0x%lx appId=0x%X", st.title_id, (int)pid, (long)base,
            (unsigned int)st.app_id);
   }
@@ -1715,7 +1793,7 @@ handle_api_cheats_state(int fd, const char *query) {
     is_ps2_st = process_is_ps2_emu(pid);
   }
   const char *fmt = cheat_kind == 1 ? "json" : (cheat_kind == 2 ? "shn" : "mc4");
-  cr_log("debug", "cheats", "loaded file=%s format=%s mods=%d", cheat_path, fmt, cJSON_GetArraySize(mods));
+  if (t_state_verbose) cr_log("debug", "cheats", "loaded file=%s format=%s mods=%d", cheat_path, fmt, cJSON_GetArraySize(mods));
 
   /* Determine version metadata for cheat selection diagnostics */
   char detected_ver[64] = {0};
@@ -1746,7 +1824,7 @@ handle_api_cheats_state(int fd, const char *query) {
         strcmp(g_cheat_select_last.cheat_path,  cheat_path) != 0 ||
         strcmp(g_cheat_select_last.detected_ver, dv)        != 0 ||
         g_cheat_select_last.version_match != version_match) {
-      cr_log("info", "cheat_select",
+      cr_log("debug", "cheat_select",
              "[game] title=%s detectedVer=%s cheatVer=%s versionMatch=%d cheatPath=%s",
              title_id, dv, cheat_ver[0] ? cheat_ver : "unknown", version_match, cheat_path);
       snprintf(g_cheat_select_last.title_id,    sizeof(g_cheat_select_last.title_id),    "%s", title_id);
@@ -1825,27 +1903,6 @@ handle_api_cheats_state(int fd, const char *query) {
     cJSON_AddStringToObject(game, "contentVersion", running_ok ? st.content_version : "");
     cJSON_AddStringToObject(game, "appVersion", running_ok ? st.app_version : "");
   }
-  /* Detect if any mod entry uses legacy_unverified mode (MC4/SHN without expected bytes) */
-  {
-    int has_legacy_unv = 0;
-    if (cheat_kind != 1) {
-      cJSON *m2 = NULL;
-      cJSON_ArrayForEach(m2, mods) {
-        cJSON *mem2 = cJSON_GetObjectItem(m2, "memory");
-        if (!cJSON_IsArray(mem2)) mem2 = cJSON_GetObjectItem(m2, "patches");
-        if (!cJSON_IsArray(mem2)) continue;
-        cJSON *e2 = NULL;
-        cJSON_ArrayForEach(e2, mem2) {
-          cJSON *exp2 = cJSON_GetObjectItem(e2, "expected");
-          if (!cJSON_IsString(exp2) || !exp2->valuestring || !exp2->valuestring[0]) {
-            has_legacy_unv = 1; break;
-          }
-        }
-        if (has_legacy_unv) break;
-      }
-    }
-    cJSON_AddBoolToObject(out, "hasLegacyUnverified", has_legacy_unv);
-  }
   cJSON *arr = cJSON_AddArrayToObject(out, "mods");
   cJSON *mismatches = cJSON_AddArrayToObject(out, "mismatches");
   int summary_on = 0, summary_off = 0, summary_mismatch = 0, summary_not_ready = 0, summary_baseline_unknown = 0;
@@ -1911,7 +1968,8 @@ handle_api_cheats_state(int fd, const char *query) {
       int mc_avail_st = 0;
       int mc_pending_st = 0; /* 1 = this mod's mastercode is not active yet */
       uint64_t mc_base_off_st = 0;
-      uint8_t mc_on_bytes_st[128]; size_t mc_on_len_st = 0;
+      uint8_t *mc_on_bytes_st CR_AUTOFREE = NULL;
+      size_t mc_on_len_st = 0;
       intptr_t mc_live_addr_st = 0;
       {
         cJSON *mc_mod_st = find_master_code_mod_for(mods, mod_index);
@@ -1923,14 +1981,19 @@ handle_api_cheats_state(int fd, const char *query) {
                               ? cJSON_GetArrayItem(mc_mem0_st, 0) : NULL;
             if (mc_e0_st) {
               cJSON *mc_on_j_st = cJSON_GetObjectItem(mc_e0_st, "on");
-              if (cJSON_IsString(mc_on_j_st) && mc_on_j_st->valuestring)
-                parse_hex_bytes_checked(mc_on_j_st->valuestring, mc_on_bytes_st, sizeof(mc_on_bytes_st), &mc_on_len_st);
+              if (cJSON_IsString(mc_on_j_st) && mc_on_j_st->valuestring) {
+                size_t mc_need_st = hex_bytes_need(mc_on_j_st->valuestring);
+                mc_on_bytes_st = malloc(mc_need_st);
+                if (mc_on_bytes_st &&
+                    parse_hex_bytes_checked(mc_on_j_st->valuestring, mc_on_bytes_st, mc_need_st, &mc_on_len_st) != 0)
+                  mc_on_len_st = 0;
+              }
             }
             mc_live_addr_st = mod_base_st + (intptr_t)mc_base_off_st;
             mc_avail_st = (mc_on_len_st > 0);
             if (mc_avail_st) {
-              uint8_t mc_cur_st[128];
-              if (read_process_memory(pid, mc_live_addr_st, mc_cur_st, mc_on_len_st) != 0 ||
+              uint8_t *mc_cur_st CR_AUTOFREE = malloc(mc_on_len_st);
+              if (!mc_cur_st || read_process_memory(pid, mc_live_addr_st, mc_cur_st, mc_on_len_st) != 0 ||
                   memcmp(mc_cur_st, mc_on_bytes_st, mc_on_len_st) != 0) {
                 mc_pending_st = 1;
               }
@@ -1952,10 +2015,19 @@ handle_api_cheats_state(int fd, const char *query) {
           reason = "memory entry missing offset/on/off";
           break;
         }
-        uint8_t on_b[128], off_b[128], exp_b[128], cur[128];
+        size_t need = hex_bytes_need(on_j->valuestring);
+        if (hex_bytes_need(off_j2->valuestring) > need) need = hex_bytes_need(off_j2->valuestring);
+        if (cJSON_IsString(expected_j) && hex_bytes_need(expected_j->valuestring) > need) need = hex_bytes_need(expected_j->valuestring);
+        uint8_t *on_b CR_AUTOFREE = malloc(need), *off_b CR_AUTOFREE = malloc(need);
+        uint8_t *exp_b CR_AUTOFREE = malloc(need), *cur CR_AUTOFREE = malloc(need);
+        if (!on_b || !off_b || !exp_b || !cur) {
+          state = CHEAT_STATE_INVALID_CHEAT;
+          reason = "out of memory";
+          break;
+        }
         size_t on_len = 0, off_len = 0, exp_len = 0;
-        if (parse_hex_bytes_checked(on_j->valuestring, on_b, sizeof(on_b), &on_len) != 0 ||
-            parse_hex_bytes_checked(off_j2->valuestring, off_b, sizeof(off_b), &off_len) != 0 || on_len != off_len) {
+        if (parse_hex_bytes_checked(on_j->valuestring, on_b, need, &on_len) != 0 ||
+            parse_hex_bytes_checked(off_j2->valuestring, off_b, need, &off_len) != 0 || on_len != off_len) {
           state = CHEAT_STATE_INVALID_CHEAT;
           reason = "invalid on/off bytes";
           break;
@@ -1967,46 +2039,29 @@ handle_api_cheats_state(int fd, const char *query) {
           break;
         }
         if (cJSON_IsString(expected_j) && expected_j->valuestring && expected_j->valuestring[0]) {
-          if (parse_hex_bytes_checked(expected_j->valuestring, exp_b, sizeof(exp_b), &exp_len) != 0 || exp_len != on_len) {
+          if (parse_hex_bytes_checked(expected_j->valuestring, exp_b, need, &exp_len) != 0 || exp_len != on_len) {
             state = CHEAT_STATE_INVALID_CHEAT;
             reason = "invalid expected bytes";
             break;
           }
         }
-        int af_s = 0, inj_s = 0, adet_s = auto_detect;
-        get_cheat_addr_flags(cheat_kind, cJSON_IsTrue(abs_j) ? 1 : 0, auto_detect, &af_s, &inj_s, &adet_s);
         /* PS2 emulation: all addresses absolute (matches apply_cheat_json). */
-        if (is_ps2_st) { af_s = 1; inj_s = 0; adet_s = 0; }
-        /* JSON off_bytes/explicit expected are reliable; MC4/SHN ValueOff is not. */
-        int exp_rel_s = (exp_len > 0) || (cheat_kind == 1 && off_len > 0);
-        const uint8_t *expect_cmp_s = exp_rel_s ? (exp_len > 0 ? exp_b : off_b) : NULL;
-        /* Skip the offbytes probe when there's no reliable expected: a blind read can hit PS5 GPU/MMIO and hang under ptrace. */
-        const char *fb_str_s = (cheat_kind == 2) ? shn_fb_s : mc4_fb_s;
-        /* Default passive reads to RELATIVE: a raw MC4/SHN offset can hit PS5 GPU/MMIO and freeze the game just from polling state. */
-        cr_addr_fallback_policy_t fb_pol_s = CR_ADDR_FALLBACK_RELATIVE;
-        if (!exp_rel_s) {
-          if (strcmp(fb_str_s, "absolute") == 0)      fb_pol_s = CR_ADDR_FALLBACK_ABSOLUTE;
-          else if (strcmp(fb_str_s, "block") == 0)    fb_pol_s = CR_ADDR_FALLBACK_BLOCK;
-          /* "relative", "legacy", or unrecognized → RELATIVE (safe default) */
-        }
-        int adet_state = exp_rel_s ? adet_s : 0;
-        intptr_t addr = cheat_resolve_write_addr_ex(pid, mod_base_st, off_u,
-                                                     af_s, inj_s, adet_state,
-                                                     on_b, on_len, expect_cmp_s, exp_rel_s,
-                                                     fb_pol_s, NULL, 1);
+        int af_s = (cJSON_IsTrue(abs_j) || is_ps2_st) ? 1 : 0;
+        intptr_t addr = cheat_resolve_addr(pid, mod_base_st, off_u, af_s,
+                                           on_b, exp_len > 0 ? exp_b : NULL, on_len);
         /* Try absolute candidate for ADDRESS_UNRESOLVED detection */
         intptr_t abs_cand2 = (intptr_t)off_u;
         intptr_t rel_cand2 = mod_base_st + (intptr_t)off_u;
-        cr_log("debug", "cheats.state",
+        if (t_state_verbose) cr_log("debug", "cheats.state",
                "read_state mod=%d off=0x%llx addr=0x%lx abs=0x%lx rel=0x%lx len=%zu",
                idx, (unsigned long long)off_u, (long)addr,
                (long)abs_cand2, (long)rel_cand2, on_len);
         if (read_process_memory(pid, addr, cur, on_len) != 0) {
           /* Try the other candidate before declaring unresolved */
           intptr_t alt = (addr == abs_cand2) ? rel_cand2 : abs_cand2;
-          cr_log("debug", "cheats.state",
+          if (t_state_verbose) cr_log("debug", "cheats.state",
                  "read_state_retry mod=%d addr=0x%lx (primary failed)", idx, (long)alt);
-          if (on_len <= sizeof(cur) && read_process_memory(pid, alt, cur, on_len) == 0) {
+          if (on_len <= need && read_process_memory(pid, alt, cur, on_len) == 0) {
             addr = alt;
           } else {
             cr_log("warn", "cheats.state",
@@ -2022,8 +2077,7 @@ handle_api_cheats_state(int fd, const char *query) {
         /* For MC4/SHN without explicit expected bytes, off_b is NOT a reliable original */
         int off_reliable = (cheat_kind == 1) || (exp_len > 0);
         int is_off = off_reliable && (memcmp(cur, (exp_len > 0 ? exp_b : off_b), on_len) == 0);
-        /* Neither matched at the naive address — retry via the master-code scan
-         * before treating this as a mismatch (mirrors apply_cheat_json). */
+        /* Neither matched at the plain address; retry through the master-code scan, same as apply_cheat_json. */
         if (!is_on && !is_off && mc_avail_st && off_len > 0 && !af_s) {
           intptr_t mc_scanned = 0;
           if (mc_scan_dep_addr(pid, mc_live_addr_st, mc_on_bytes_st, mc_on_len_st,
@@ -2035,7 +2089,7 @@ handle_api_cheats_state(int fd, const char *query) {
             is_off = off_reliable && (memcmp(cur, (exp_len > 0 ? exp_b : off_b), on_len) == 0);
           }
         }
-        /* Another mod claimed this address (cave/JMP redirect) — treat as OFF, not mismatch, for mutually-exclusive cheats. */
+        /* Another mod owns this address (cave/JMP redirect): report OFF, not a mismatch. */
         int cross_mod_inactive = 0;
         if (!is_on && !is_off && off_reliable) {
           if (on_len >= 16) {
@@ -2051,8 +2105,7 @@ handle_api_cheats_state(int fd, const char *query) {
           off_matches++;
           if (cross_mod_inactive) cross_inactive_matches++;
         }
-        /* Its own mastercode isn't active yet — the address doesn't hold real
-         * game state, so this isn't a reliable mismatch, just an unconfirmed baseline. */
+        /* Its mastercode is not active yet, so the bytes are not real game state: unconfirmed baseline, not a mismatch. */
         int mc_dep_pending = mc_avail_st && mc_pending_st;
         if (!is_on && !is_off && !cross_mod_inactive && off_reliable) {
           if (mc_dep_pending) {
@@ -2085,8 +2138,7 @@ handle_api_cheats_state(int fd, const char *query) {
             bytes_to_hex(exp_len > 0 ? exp_b : off_b, on_len > 16 ? 16 : on_len, exp_hex, sizeof(exp_hex));
             snprintf(addr_hex, sizeof(addr_hex), "0x%lx", (long)addr);
             snprintf(off_hex_addr, sizeof(off_hex_addr), "0x%llX", (unsigned long long)off_u);
-            /* Detect if current bytes are all printable ASCII — strong sign the
-             * offset landed in string/data rather than executable code. */
+            /* All-printable ASCII usually means the offset landed in string data, not code. */
             int cur_is_ascii = (on_len > 0);
             for (size_t _ai = 0; _ai < on_len && cur_is_ascii; _ai++) {
               if (cur[_ai] < 0x20 || cur[_ai] > 0x7E) cur_is_ascii = 0;
@@ -2156,8 +2208,7 @@ handle_api_cheats_state(int fd, const char *query) {
         } else if (on_matches > 0 && total > 0 && on_matches + cross_inactive_matches == total &&
                    off_matches == cross_inactive_matches && mismatch == 0 &&
                    baseline_unknown == 0 && off_val_matches == 0) {
-          /* Remaining entries are cave/hook space now owned by another active mod
-           * (e.g. this mastercode's own dependents writing into its cave) — still ON. */
+          /* Leftover entries are cave/hook space owned by another active mod (e.g. a mastercode's dependents); still ON. */
           state = CHEAT_STATE_ON;
         } else if (mismatch > 0 && baseline_unknown == 0 && on_matches == 0 &&
                    off_matches == 0 && off_val_matches == 0) {
@@ -2212,8 +2263,7 @@ handle_api_cheats_state(int fd, const char *query) {
       }
       pthread_mutex_unlock(&g_crash_guard_lock);
     }
-    /* Conflict detection: find mods that share address ranges with this one.
-     * If any conflicting mod is currently active → promote non-ON states to CONFLICT. */
+    /* Promote non-ON states to CONFLICT when a mod sharing address ranges is active. */
     int conflict_mods[16];
     int conflict_count = 0;
     char conflict_reason_buf[128];
@@ -2279,7 +2329,10 @@ handle_api_cheats_state(int fd, const char *query) {
       if (state == CHEAT_STATE_ON || state == CHEAT_STATE_ON_UNVERIFIED) {
         visual_state = "on"; can_enable_flag = 0; can_disable_flag = 1;
       } else if (state == CHEAT_STATE_OFF || state == CHEAT_STATE_OFF_UNVERIFIED ||
-                 state == CHEAT_STATE_BASELINE_UNKNOWN) {
+                 state == CHEAT_STATE_BASELINE_UNKNOWN || state == CHEAT_STATE_MISMATCH ||
+                 state == CHEAT_STATE_ADDRESS_UNRESOLVED || state == CHEAT_STATE_READ_FAILED ||
+                 state == CHEAT_STATE_FORMAT_NEEDS_REVIEW) {
+        /* Mismatch/unresolved stay clickable; the state only serves as a hint. */
         visual_state = "off"; can_enable_flag = 1; can_disable_flag = 0;
       } else if (state == CHEAT_STATE_CONFLICT) {
         /* Conflicting mods can still be enabled — engine auto-disables the blocker */
@@ -2326,7 +2379,7 @@ handle_api_cheats_state(int fd, const char *query) {
     cJSON_AddNumberToObject(summary, "baselineUnknown", summary_baseline_unknown);
     cJSON_AddNumberToObject(summary, "notReady", summary_not_ready);
   }
-  cr_log("debug", "cheats", "state summary title=%s on=%d off=%d mismatch=%d baselineUnknown=%d notReady=%d file=%s format=%s pid=%d base=0x%lx",
+  if (t_state_verbose) cr_log("debug", "cheats", "state summary title=%s on=%d off=%d mismatch=%d baselineUnknown=%d notReady=%d file=%s format=%s pid=%d base=0x%lx",
          title_id, summary_on, summary_off, summary_mismatch, summary_baseline_unknown, summary_not_ready, cheat_path, fmt, (int)pid, (long)base);
 
   char *txt = cJSON_PrintUnformatted(out);
@@ -2415,8 +2468,8 @@ handle_api_cheats_select(int fd, const char *query) {
       "{\"ok\":false,\"error\":\"version_mismatch\",\"message\":\"This file has a different version than the running game. Add force=1 to override.\"}");
     return;
   }
-  /* Block file switch when mods from the current (different) file are still active.
-   * Switching files while hooks point to caves that the new file will overwrite causes SIGSEGV. */
+  /* Block a file switch while mods from the current file are active; their hooks point into caves
+   * the new file would overwrite. */
   if (sel_st.running && strcmp(sel_st.title_id, title_id) == 0 && !force) {
     char cur_path[256] = {0};
     int  cur_kind = 0;
@@ -2490,14 +2543,6 @@ check_mod_enable_state(const char *title_id, int mod_index, char *reason, size_t
     snprintf(reason, reason_size, "%s", err[0] ? err : "invalid cheat");
     return CHEAT_STATE_INVALID_CHEAT;
   }
-  int auto_detect_cme = 1;
-  char mc4_fb_cme[16] = "legacy";
-  char shn_fb_cme[16] = "legacy";
-  pthread_mutex_lock(&g_cfg_lock);
-  auto_detect_cme = g_cfg.cheat_address_auto_detect;
-  snprintf(mc4_fb_cme, sizeof(mc4_fb_cme), "%s", g_cfg.cheat_mc4_unverified_fallback);
-  snprintf(shn_fb_cme, sizeof(shn_fb_cme), "%s", g_cfg.cheat_shn_unverified_fallback);
-  pthread_mutex_unlock(&g_cfg_lock);
   cJSON *mods = cJSON_GetObjectItem(root, "mods");
   if (!cJSON_IsArray(mods) || mod_index < 0 || mod_index >= cJSON_GetArraySize(mods)) {
     cJSON_Delete(root);
@@ -2540,8 +2585,7 @@ check_mod_enable_state(const char *title_id, int mod_index, char *reason, size_t
       }
     }
   }
-  /* Fast path: MC4/SHN mods without expected bytes always yield BASELINE_UNKNOWN.
-   * Skip ptrace to eliminate the double-attach race (check then apply both attach). */
+  /* MC4/SHN mods without expected bytes are always BASELINE_UNKNOWN; skip the attach to avoid a double-attach race. */
   if (cheat_kind_cme != 1) {
     cJSON *mod_fp = cJSON_GetArrayItem(mods, mod_index);
     cJSON *mem_fp = cJSON_GetObjectItem(mod_fp, "memory");
@@ -2618,10 +2662,19 @@ check_mod_enable_state(const char *title_id, int mod_index, char *reason, size_t
         snprintf(reason, reason_size, "memory entry missing offset/on/off");
         break;
       }
-      uint8_t on_b[128], off_b[128], exp_b[128], cur[128];
+      size_t need = hex_bytes_need(on_j->valuestring);
+      if (hex_bytes_need(off_j2->valuestring) > need) need = hex_bytes_need(off_j2->valuestring);
+      if (cJSON_IsString(expected_j) && hex_bytes_need(expected_j->valuestring) > need) need = hex_bytes_need(expected_j->valuestring);
+      uint8_t *on_b CR_AUTOFREE = malloc(need), *off_b CR_AUTOFREE = malloc(need);
+      uint8_t *exp_b CR_AUTOFREE = malloc(need), *cur CR_AUTOFREE = malloc(need);
+      if (!on_b || !off_b || !exp_b || !cur) {
+        state = CHEAT_STATE_INVALID_CHEAT;
+        snprintf(reason, reason_size, "out of memory");
+        break;
+      }
       size_t on_len = 0, off_len = 0, exp_len = 0;
-      if (parse_hex_bytes_checked(on_j->valuestring, on_b, sizeof(on_b), &on_len) != 0 ||
-          parse_hex_bytes_checked(off_j2->valuestring, off_b, sizeof(off_b), &off_len) != 0 || on_len != off_len) {
+      if (parse_hex_bytes_checked(on_j->valuestring, on_b, need, &on_len) != 0 ||
+          parse_hex_bytes_checked(off_j2->valuestring, off_b, need, &off_len) != 0 || on_len != off_len) {
         state = CHEAT_STATE_INVALID_CHEAT;
         snprintf(reason, reason_size, "invalid on/off bytes");
         break;
@@ -2633,29 +2686,16 @@ check_mod_enable_state(const char *title_id, int mod_index, char *reason, size_t
         break;
       }
       if (cJSON_IsString(expected_j) && expected_j->valuestring && expected_j->valuestring[0]) {
-        if (parse_hex_bytes_checked(expected_j->valuestring, exp_b, sizeof(exp_b), &exp_len) != 0 || exp_len != on_len) {
+        if (parse_hex_bytes_checked(expected_j->valuestring, exp_b, need, &exp_len) != 0 || exp_len != on_len) {
           state = CHEAT_STATE_INVALID_CHEAT;
           snprintf(reason, reason_size, "invalid expected bytes");
           break;
         }
       }
-      int af_cme = 0, inj_cme = 0, adet_cme = auto_detect_cme;
-      get_cheat_addr_flags(cheat_kind_cme, cJSON_IsTrue(abs_j) ? 1 : 0, auto_detect_cme, &af_cme, &inj_cme, &adet_cme);
       /* PS2 emulation: all addresses absolute (matches apply_cheat_json). */
-      if (is_ps2_cme) { af_cme = 1; inj_cme = 0; adet_cme = 0; }
-      int exp_rel_cme = (exp_len > 0) || (cheat_kind_cme == 1 && off_len > 0);
-      const uint8_t *expect_cme = exp_rel_cme ? (exp_len > 0 ? exp_b : off_b) : NULL;
-      const char *fb_str_cme = (cheat_kind_cme == 2) ? shn_fb_cme : mc4_fb_cme;
-      cr_addr_fallback_policy_t fb_pol_cme = CR_ADDR_FALLBACK_LEGACY;
-      if (!exp_rel_cme) {
-        if (strcmp(fb_str_cme, "absolute") == 0)      fb_pol_cme = CR_ADDR_FALLBACK_ABSOLUTE;
-        else if (strcmp(fb_str_cme, "relative") == 0) fb_pol_cme = CR_ADDR_FALLBACK_RELATIVE;
-        else if (strcmp(fb_str_cme, "block") == 0)    fb_pol_cme = CR_ADDR_FALLBACK_BLOCK;
-      }
-      intptr_t addr = cheat_resolve_write_addr_ex(st.pid, mod_base_cme, off_u,
-                                                   af_cme, inj_cme, adet_cme,
-                                                   on_b, on_len, expect_cme, exp_rel_cme,
-                                                   fb_pol_cme, NULL, 1);
+      int af_cme = (cJSON_IsTrue(abs_j) || is_ps2_cme) ? 1 : 0;
+      intptr_t addr = cheat_resolve_addr(st.pid, mod_base_cme, off_u, af_cme,
+                                         on_b, exp_len > 0 ? exp_b : NULL, on_len);
       if (read_process_memory(st.pid, addr, cur, on_len) != 0) {
         state = CHEAT_STATE_READ_FAILED;
         snprintf(reason, reason_size, "read failed");
@@ -2772,11 +2812,6 @@ handle_api_cheats_apply_dryrun(int fd, const char *query) {
   pid_t pid = running_ok ? st.pid : -1;
   intptr_t base = running_ok ? st.image_base : 0;
 
-  int auto_detect = 1;
-  pthread_mutex_lock(&g_cfg_lock);
-  auto_detect = g_cfg.cheat_address_auto_detect;
-  pthread_mutex_unlock(&g_cfg_lock);
-
   /* Probing reads are mdbg-backed and need no ptrace attach. */
   int attached = 0;
   if (running_ok && pid > 0) {
@@ -2835,12 +2870,17 @@ handle_api_cheats_apply_dryrun(int fd, const char *query) {
         continue;
       }
 
-      uint8_t on_b[128], off_b[128], exp_b[128], cur_b[128];
+      size_t need = hex_bytes_need(on_j->valuestring);
+      if (hex_bytes_need(off_j2->valuestring) > need) need = hex_bytes_need(off_j2->valuestring);
+      if (cJSON_IsString(exp_j) && hex_bytes_need(exp_j->valuestring) > need) need = hex_bytes_need(exp_j->valuestring);
+      uint8_t *on_b CR_AUTOFREE = malloc(need), *off_b CR_AUTOFREE = malloc(need);
+      uint8_t *exp_b CR_AUTOFREE = malloc(need), *cur_b CR_AUTOFREE = malloc(need);
       size_t on_len = 0, off_len = 0, exp_len = 0;
       uint64_t off_u = 0;
 
-      if (parse_hex_bytes_checked(on_j->valuestring, on_b, sizeof(on_b), &on_len) != 0 ||
-          parse_hex_bytes_checked(off_j2->valuestring, off_b, sizeof(off_b), &off_len) != 0 ||
+      if (!on_b || !off_b || !exp_b || !cur_b ||
+          parse_hex_bytes_checked(on_j->valuestring, on_b, need, &on_len) != 0 ||
+          parse_hex_bytes_checked(off_j2->valuestring, off_b, need, &off_len) != 0 ||
           parse_offset_hex_checked(off_j->valuestring, &off_u) != 0 ||
           on_len == 0 || on_len != off_len) {
         cJSON_AddStringToObject(we, "error", "hex parse failed or on/off size mismatch");
@@ -2849,7 +2889,7 @@ handle_api_cheats_apply_dryrun(int fd, const char *query) {
         continue;
       }
       if (cJSON_IsString(exp_j) && exp_j->valuestring && exp_j->valuestring[0]) {
-        parse_hex_bytes_checked(exp_j->valuestring, exp_b, sizeof(exp_b), &exp_len);
+        parse_hex_bytes_checked(exp_j->valuestring, exp_b, need, &exp_len);
       }
 
       cJSON_AddStringToObject(we, "rawOffset", off_j->valuestring);
@@ -2857,16 +2897,10 @@ handle_api_cheats_apply_dryrun(int fd, const char *query) {
       cJSON_AddStringToObject(we, "offBytes", off_j2->valuestring);
       cJSON_AddNumberToObject(we, "len", (double)on_len);
 
-      int af = 0, inj = 0, adet = auto_detect;
-      get_cheat_addr_flags(cheat_kind, cJSON_IsTrue(abs_j) ? 1 : 0, auto_detect, &af, &inj, &adet);
       /* PS2 emulation: all addresses absolute (matches apply_cheat_json). */
-      if (is_ps2_dr) { af = 1; inj = 0; adet = 0; }
-      int exp_rel_dr = (exp_len > 0) || (cheat_kind == 1 && off_len > 0);
-      const uint8_t *expect_cmp = exp_rel_dr ? (exp_len > 0 ? exp_b : off_b) : NULL;
+      int af = (cJSON_IsTrue(abs_j) || is_ps2_dr) ? 1 : 0;
       intptr_t addr = (pid > 0 && attached) ?
-        cheat_resolve_write_addr_ex(pid, mod_base_dr, off_u, af, inj, adet,
-                                    on_b, on_len, expect_cmp, exp_rel_dr,
-                                    CR_ADDR_FALLBACK_LEGACY, NULL, 1) :
+        cheat_resolve_addr(pid, mod_base_dr, off_u, af, on_b, exp_len > 0 ? exp_b : NULL, on_len) :
         (af ? (intptr_t)off_u : mod_base_dr + (intptr_t)off_u);
 
       char addrh[32]; snprintf(addrh, sizeof(addrh), "0x%lx", (long)addr);
@@ -2944,37 +2978,18 @@ handle_api_cheats_toggle(int fd, const char *query) {
     return;
   }
   int allow_force = 0;
-  int allow_unsafe_mc4 = 0;
-  int allow_legacy_mc4 = 0;
-  int allow_legacy_shn = 0;
   pthread_mutex_lock(&g_cfg_lock);
   allow_force = g_cfg.allow_force_enable;
-  allow_unsafe_mc4 = g_cfg.allow_unsafe_mc4_apply;
-  allow_legacy_mc4 = g_cfg.allow_legacy_mc4_without_expected;
-  allow_legacy_shn = g_cfg.allow_legacy_shn_without_expected;
   pthread_mutex_unlock(&g_cfg_lock);
   if (on && !(force && allow_force)) {
     char reason[160] = {0};
     cheat_state_kind_t st = check_mod_enable_state(title_id, idx, reason, sizeof(reason));
-    int block = 0;
-    /* Allow BASELINE_UNKNOWN if unsafe is on, or if legacy fallback is permitted
-     * (apply_cheat_json will enforce the actual per-format policy). */
-    if (st == CHEAT_STATE_BASELINE_UNKNOWN &&
-        !allow_unsafe_mc4 && !allow_legacy_mc4 && !allow_legacy_shn) {
-      block = 1;
-    } else if (st == CHEAT_STATE_CRASH_SUSPECT) {
-      block = 1;
-    } else if (st == CHEAT_STATE_ADDRESS_UNRESOLVED || st == CHEAT_STATE_FORMAT_NEEDS_REVIEW ||
-               st == CHEAT_STATE_MISMATCH || st == CHEAT_STATE_GAME_NOT_RUNNING ||
-               st == CHEAT_STATE_PROCESS_NOT_FOUND || st == CHEAT_STATE_BASE_NOT_READY ||
-               st == CHEAT_STATE_READ_FAILED || st == CHEAT_STATE_INVALID_CHEAT ||
-               st == CHEAT_STATE_GAME_LOADING) {
-      block = 1;
-    }
+    /* Only a crash-suspect stops a click; everything else is left to the apply itself. */
+    int block = (st == CHEAT_STATE_CRASH_SUSPECT);
     if (block) {
       char *esc = json_escape(reason[0] ? reason : "refusing to patch");
       snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"%s\",\"message\":\"%s\"}",
-               st == CHEAT_STATE_MISMATCH ? "version_mismatch" : cheat_state_key(st), esc ? esc : "refusing to patch");
+               cheat_state_key(st), esc ? esc : "refusing to patch");
       free(esc);
       cr_log("warn", "cheats", "refusing enable mod=%d title=%s reason=%s", idx, title_id, reason);
       http_send_json(fd, 400, body);
@@ -3154,12 +3169,14 @@ handle_api_cheats_validate(int fd, const char *query) {
         invalid++;
         continue;
       }
-      uint8_t b1[128], b2[128];
+      size_t need = hex_bytes_need(on_j->valuestring);
+      if (hex_bytes_need(off_j2->valuestring) > need) need = hex_bytes_need(off_j2->valuestring);
+      uint8_t *b1 CR_AUTOFREE = malloc(need), *b2 CR_AUTOFREE = malloc(need);
       size_t l1 = 0, l2 = 0;
       uint64_t off_u = 0;
-      if (parse_offset_hex_checked(off_j->valuestring, &off_u) != 0 ||
-          parse_hex_bytes_checked(on_j->valuestring, b1, sizeof(b1), &l1) != 0 ||
-          parse_hex_bytes_checked(off_j2->valuestring, b2, sizeof(b2), &l2) != 0 || l1 != l2) {
+      if (!b1 || !b2 || parse_offset_hex_checked(off_j->valuestring, &off_u) != 0 ||
+          parse_hex_bytes_checked(on_j->valuestring, b1, need, &l1) != 0 ||
+          parse_hex_bytes_checked(off_j2->valuestring, b2, need, &l2) != 0 || l1 != l2) {
         invalid++;
       }
     }
@@ -3224,7 +3241,7 @@ handle_api_cheats_upload(int fd, const char *query, const char *body, size_t bod
   http_send_json(fd, 200, resp);
 }
 
-/* GET /api/cheats/address-debug: shows which of absolute/relative candidate addresses matches on/off/expected; needs game running. */
+/* Shows which of the absolute/relative addresses matches ON/OFF/expected; needs a running game. */
 void
 handle_api_cheats_address_debug(int fd, const char *query) {
   char raw_title_id[32] = {0};
@@ -3250,15 +3267,6 @@ handle_api_cheats_address_debug(int fd, const char *query) {
   int title_match = running_ok && strcmp(st.title_id, title_id) == 0;
   pid_t pid = running_ok ? st.pid : -1;
   intptr_t base = running_ok ? st.image_base : 0;
-
-  int auto_detect = 1;
-  char mc4_fb_adbg[16] = "legacy";
-  char shn_fb_adbg[16] = "legacy";
-  pthread_mutex_lock(&g_cfg_lock);
-  auto_detect = g_cfg.cheat_address_auto_detect;
-  snprintf(mc4_fb_adbg, sizeof(mc4_fb_adbg), "%s", g_cfg.cheat_mc4_unverified_fallback);
-  snprintf(shn_fb_adbg, sizeof(shn_fb_adbg), "%s", g_cfg.cheat_shn_unverified_fallback);
-  pthread_mutex_unlock(&g_cfg_lock);
 
   /* Probing reads are mdbg-backed and need no ptrace attach. */
   int attach_ok = 0;
@@ -3286,7 +3294,6 @@ handle_api_cheats_address_debug(int fd, const char *query) {
       cJSON_AddNumberToObject(g, "pid", (double)(running_ok ? pid : -1));
     }
   }
-  cJSON_AddBoolToObject(out, "autoDetect", auto_detect);
 
   cJSON *mod_arr = cJSON_AddArrayToObject(out, "mods");
 
@@ -3321,12 +3328,16 @@ handle_api_cheats_address_debug(int fd, const char *query) {
             continue;
           }
 
-          uint8_t on_b[128], off_b[128], exp_b[128];
+          size_t need = hex_bytes_need(on_j->valuestring);
+          if (hex_bytes_need(off_j2->valuestring) > need) need = hex_bytes_need(off_j2->valuestring);
+          if (cJSON_IsString(exp_j) && hex_bytes_need(exp_j->valuestring) > need) need = hex_bytes_need(exp_j->valuestring);
+          uint8_t *on_b CR_AUTOFREE = malloc(need), *off_b CR_AUTOFREE = malloc(need), *exp_b CR_AUTOFREE = malloc(need);
           size_t on_len = 0, off_len = 0, exp_len = 0;
           uint64_t off_u = 0;
 
-          if (parse_hex_bytes_checked(on_j->valuestring, on_b, sizeof(on_b), &on_len) != 0 ||
-              parse_hex_bytes_checked(off_j2->valuestring, off_b, sizeof(off_b), &off_len) != 0 ||
+          if (!on_b || !off_b || !exp_b ||
+              parse_hex_bytes_checked(on_j->valuestring, on_b, need, &on_len) != 0 ||
+              parse_hex_bytes_checked(off_j2->valuestring, off_b, need, &off_len) != 0 ||
               on_len != off_len || on_len == 0) {
             cJSON_AddStringToObject(pe, "error", "invalid on/off bytes");
             cJSON_AddItemToArray(patch_arr, pe);
@@ -3338,7 +3349,7 @@ handle_api_cheats_address_debug(int fd, const char *query) {
             continue;
           }
           if (cJSON_IsString(exp_j) && exp_j->valuestring && exp_j->valuestring[0]) {
-            parse_hex_bytes_checked(exp_j->valuestring, exp_b, sizeof(exp_b), &exp_len);
+            parse_hex_bytes_checked(exp_j->valuestring, exp_b, need, &exp_len);
           }
 
           char off_hex[32]; snprintf(off_hex, sizeof(off_hex), "0x%llX", (unsigned long long)off_u);
@@ -3348,30 +3359,13 @@ handle_api_cheats_address_debug(int fd, const char *query) {
           intptr_t abs_cand = (intptr_t)off_u;
           intptr_t rel_cand = base + (intptr_t)off_u;
 
-          int exp_rel_adbg = (exp_len > 0) || (cheat_kind == 1 && off_len > 0);
-          const uint8_t *expect_cmp = exp_rel_adbg ? (exp_len > 0 ? exp_b : off_b) : NULL;
-          const char *fb_str_adbg = (cheat_kind == 2) ? shn_fb_adbg : mc4_fb_adbg;
-          cr_addr_fallback_policy_t fb_pol_adbg = CR_ADDR_FALLBACK_LEGACY;
-          if (!exp_rel_adbg) {
-            if (strcmp(fb_str_adbg, "absolute") == 0)      fb_pol_adbg = CR_ADDR_FALLBACK_ABSOLUTE;
-            else if (strcmp(fb_str_adbg, "relative") == 0) fb_pol_adbg = CR_ADDR_FALLBACK_RELATIVE;
-            else if (strcmp(fb_str_adbg, "block") == 0)    fb_pol_adbg = CR_ADDR_FALLBACK_BLOCK;
-          }
-          cr_addr_resolve_status_t resolve_st_adbg = CR_ADDR_RESOLVE_OK_VERIFIED;
-          int af_adbg = 0, inj_adbg = 0, adet_adbg = auto_detect;
-          get_cheat_addr_flags(cheat_kind, cJSON_IsTrue(abs_j) ? 1 : 0, auto_detect,
-                               &af_adbg, &inj_adbg, &adet_adbg);
-          intptr_t resolved = cheat_resolve_write_addr_ex(pid, base, off_u,
-                                                          af_adbg, inj_adbg, adet_adbg,
-                                                          on_b, on_len, expect_cmp, exp_rel_adbg,
-                                                          fb_pol_adbg, &resolve_st_adbg, 1);
+          const uint8_t *expect_cmp = exp_len > 0 ? exp_b : NULL;
+          intptr_t resolved = cheat_resolve_addr(pid, base, off_u, cJSON_IsTrue(abs_j) ? 1 : 0,
+                                                 on_b, expect_cmp, on_len);
           char res_hex[32]; snprintf(res_hex, sizeof(res_hex), "0x%lx", (long)resolved);
           cJSON_AddStringToObject(pe, "resolvedAddress", res_hex);
           cJSON_AddStringToObject(pe, "resolvedMode",
                                   resolved == abs_cand ? "absolute" : "relative");
-          cJSON_AddNumberToObject(pe, "resolvedStatus", (double)resolve_st_adbg);
-          cJSON_AddBoolToObject(pe, "expectedReliable", exp_rel_adbg);
-          cJSON_AddStringToObject(pe, "fallbackPolicy", fb_str_adbg);
 
           cJSON *cands_j = cJSON_AddArrayToObject(pe, "candidates");
 
@@ -3381,8 +3375,8 @@ handle_api_cheats_address_debug(int fd, const char *query) {
             char ah[32]; snprintf(ah, sizeof(ah), "0x%lx", (long)abs_cand);
             cJSON_AddStringToObject(ca, "mode", "absolute");
             cJSON_AddStringToObject(ca, "address", ah);
-            if (attach_ok && on_len <= 128) {
-              uint8_t buf[128];
+            uint8_t *buf CR_AUTOFREE = attach_ok ? malloc(on_len) : NULL;
+            if (buf) {
               int rd = read_process_memory(pid, abs_cand, buf, on_len);
               cJSON_AddBoolToObject(ca, "readOk", rd == 0);
               if (rd == 0) {
@@ -3404,8 +3398,8 @@ handle_api_cheats_address_debug(int fd, const char *query) {
             char rh[32]; snprintf(rh, sizeof(rh), "0x%lx", (long)rel_cand);
             cJSON_AddStringToObject(cr2, "mode", "relative");
             cJSON_AddStringToObject(cr2, "address", rh);
-            if (attach_ok && on_len <= 128) {
-              uint8_t buf[128];
+            uint8_t *buf CR_AUTOFREE = attach_ok ? malloc(on_len) : NULL;
+            if (buf) {
               int rd = read_process_memory(pid, rel_cand, buf, on_len);
               cJSON_AddBoolToObject(cr2, "readOk", rd == 0);
               if (rd == 0) {
@@ -3450,120 +3444,6 @@ handle_api_cheats_address_debug(int fd, const char *query) {
   free(s);
 }
 
-
-void
-handle_api_cheats_sources(int fd) {
-  source_config_model_t model;
-  source_model_load(&model);
-  int sources_enabled = 1;
-  cfg_get_cheat_remote_opts(&sources_enabled, NULL, NULL, NULL);
-  cJSON *out = cJSON_CreateObject();
-  cJSON_AddBoolToObject(out, "ok", 1);
-  cJSON *arr = cJSON_AddArrayToObject(out, "sources");
-  for (int i = 0; i < model.cheat_count; i++) {
-    cJSON *s = cJSON_CreateObject();
-    cJSON_AddStringToObject(s, "id", model.cheat_sources[i].id);
-    cJSON_AddStringToObject(s, "name", model.cheat_sources[i].name);
-    cJSON_AddStringToObject(s, "type", model.cheat_sources[i].type);
-    cJSON_AddBoolToObject(s, "enabled", sources_enabled && model.cheat_sources[i].enabled);
-    cJSON_AddItemToArray(arr, s);
-  }
-  char *txt = cJSON_PrintUnformatted(out);
-  cJSON_Delete(out);
-  if (!txt) {
-    http_send_oom(fd);
-    return;
-  }
-  http_send_json(fd, 200, txt);
-  free(txt);
-}
-
-/* ---- /api/sources/jobs/start ---- */
-
-void
-handle_api_sources_jobs_start(int fd, const char *body_json) {
-  cJSON *req = NULL;
-  if (parse_json_from_body(body_json, &req) != 0) {
-    http_send_json(fd, 400, "{\"ok\":false,\"error\":\"invalid_json\"}");
-    return;
-  }
-  int job_id = 0;
-  int rc = cr_source_job_start(req, &job_id);
-  cJSON_Delete(req);
-  if (rc == -2) {
-    http_send_json(fd, 400, "{\"ok\":false,\"error\":\"unknown_type\"}");
-    return;
-  }
-  if (rc == -3) {
-    http_send_json(fd, 400, "{\"ok\":false,\"error\":\"invalid_titleId\"}");
-    return;
-  }
-  if (rc == -4) {
-    http_send_json(fd, 503, "{\"ok\":false,\"error\":\"job_queue_full\",\"message\":\"Too many concurrent remote operations. Try again.\"}");
-    return;
-  }
-  if (rc != 0) {
-    http_send_json(fd, 500, "{\"ok\":false,\"error\":\"job_start_failed\"}");
-    return;
-  }
-  char resp[64];
-  snprintf(resp, sizeof(resp), "{\"ok\":true,\"jobId\":%d}", job_id);
-  http_send_json(fd, 202, resp);
-}
-
-/* ---- /api/sources/jobs/status ---- */
-
-void
-handle_api_sources_jobs_status(int fd, const char *query) {
-  char id_str[32] = {0};
-  if (query_value(query, "id", id_str, sizeof(id_str)) != 0 || !id_str[0]) {
-    http_send_json(fd, 400, "{\"ok\":false,\"error\":\"missing_id\"}");
-    return;
-  }
-  int job_id = atoi(id_str);
-  if (job_id <= 0) {
-    http_send_json(fd, 400, "{\"ok\":false,\"error\":\"invalid_id\"}");
-    return;
-  }
-  cJSON *out = cr_source_job_status_json(job_id);
-  if (!out) {
-    http_send_oom(fd);
-    return;
-  }
-  int status = cJSON_GetObjectItem(out, "notFound") ? 404 : 200;
-  char *txt = cJSON_PrintUnformatted(out);
-  cJSON_Delete(out);
-  if (!txt) {
-    http_send_oom(fd);
-    return;
-  }
-  http_send_json(fd, status, txt);
-  free(txt);
-}
-
-/* ---- Legacy stubs (replaced by /api/sources/jobs/start) ---- */
-
-void
-handle_api_cheats_remote_find(int fd, const char *query) {
-  char raw_title_id[32] = {0};
-  char title_id[10] = {0};
-  char version[64] = {0};
-  if (query_value(query, "titleId", raw_title_id, sizeof(raw_title_id)) != 0 ||
-      !title_id_normalize(raw_title_id, title_id)) {
-    http_send_json(fd, 400, "{\"ok\":false,\"error\":\"invalid_titleId\"}");
-    return;
-  }
-  query_value(query, "version", version, sizeof(version));
-  (void)title_id; (void)version;
-  http_send_json(fd, 409, "{\"ok\":false,\"error\":\"use_jobs\",\"message\":\"Use POST /api/sources/jobs/start instead.\"}");
-}
-
-
-void
-handle_api_cheats_remote_download(int fd, const char *body_json) {
-  (void)body_json;
-  http_send_json(fd, 409, "{\"ok\":false,\"error\":\"use_jobs\",\"message\":\"Use POST /api/sources/jobs/start instead.\"}");
-}
 
 void
 handle_api_cheats_find(int fd, const char *query) {
@@ -3722,15 +3602,17 @@ handle_api_cheats_repo_download(int fd, const char *query) {
                      strcmp(source, "ps5cheats")     != 0 &&
                      strcmp(source, "goldhen")       != 0 &&
                      strcmp(source, "henppsa")       != 0 &&
+                     strcmp(source, "psgamepatch")   != 0 &&
+                     strcmp(source, "crpatches")     != 0 &&
                      strcmp(source, "all")           != 0)) {
     http_send_json(fd, 400,
       "{\"ok\":false,\"error\":\"invalid_source\","
-      "\"message\":\"source must be hencollection, ps5cheats, goldhen, henppsa, or all\"}");
+      "\"message\":\"source must be hencollection, ps5cheats, goldhen, henppsa, psgamepatch, crpatches, or all\"}");
     return;
   }
 
   if (repo_mirror_start(source, overwrite) != 0) {
-    char buf[256];
+    char buf[4096];
     repo_mirror_status_json(buf, sizeof(buf));
     http_send_json(fd, 409, buf);
     return;
@@ -3745,12 +3627,12 @@ handle_api_cheats_repo_download(int fd, const char *query) {
 /* GET /api/cheats/repo/download/status */
 void
 handle_api_cheats_repo_download_status(int fd) {
-  char buf[2048];
+  char buf[4096];
   repo_mirror_status_json(buf, sizeof(buf));
   http_send_json(fd, 200, buf);
 }
 
-/* Legacy /api/cheats/download-all — kept for backward compat, starts a mirror of all sources */
+/* Starts a mirror of all sources (older endpoint, kept for compatibility). */
 void
 handle_api_cheats_download_all(int fd) {
   if (repo_mirror_start("all", 0) == 0) {
@@ -4196,20 +4078,13 @@ handle_api_diag_title(int fd, const char *query) {
   }
 
   {
-    char uid_cfg[32] = {0}, mc4mode[16] = {0}, shnmode[16] = {0};
-    int unsafe_mc4 = 0;
+    char uid_cfg[32] = {0};
     pthread_mutex_lock(&g_cfg_lock);
     snprintf(uid_cfg,  sizeof(uid_cfg),  "%s", g_cfg.launch_user_id);
-    snprintf(mc4mode,  sizeof(mc4mode),  "%s", g_cfg.cheat_mc4_address_mode);
-    snprintf(shnmode,  sizeof(shnmode),  "%s", g_cfg.cheat_shn_address_mode);
-    unsafe_mc4 = g_cfg.allow_unsafe_mc4_apply;
     pthread_mutex_unlock(&g_cfg_lock);
     cJSON *cfg = cJSON_AddObjectToObject(out, "config");
     if (cfg) {
       cJSON_AddStringToObject(cfg, "launchUserId", uid_cfg[0] ? uid_cfg : "auto");
-      cJSON_AddStringToObject(cfg, "cheatMc4AddressMode", mc4mode[0] ? mc4mode : "auto");
-      cJSON_AddStringToObject(cfg, "cheatShnAddressMode", shnmode[0] ? shnmode : "auto");
-      cJSON_AddBoolToObject(cfg, "allowUnsafeMc4Apply", unsafe_mc4);
     }
   }
 
@@ -4429,8 +4304,9 @@ handle_api_cheats_mc4_debug(int fd, const char *query) {
           cJSON_AddBoolToObject(pe, "absoluteFlag", cJSON_IsTrue(abs_j));
           size_t elen = 0;
           if (cJSON_IsString(exp_j) && exp_j->valuestring && exp_j->valuestring[0]) {
-            uint8_t tmp[128];
-            parse_hex_bytes_checked(exp_j->valuestring, tmp, sizeof(tmp), &elen);
+            size_t tmp_need = hex_bytes_need(exp_j->valuestring);
+            uint8_t *tmp CR_AUTOFREE = malloc(tmp_need);
+            if (tmp) parse_hex_bytes_checked(exp_j->valuestring, tmp, tmp_need, &elen);
           }
           int off_reliable = (elen > 0);
           cJSON_AddBoolToObject(pe, "offReliable", off_reliable);
@@ -4486,8 +4362,7 @@ handle_api_cheats_disable_all(int fd, const char *query) {
     if (mod_enabled_check(title_id, rs.pid, i)) {
       if (need_delay) usleep(1000000);
       char apply_err[256] = {0};
-      /* Reset cooldown guard so rapid sequential disables aren't blocked by it.
-       * Setting to 0 makes elapsed = now - 0 = very large, bypassing the pre-check. */
+      /* Clear the cooldown so rapid disables are not blocked. */
       g_last_apply_at_ms = 0;
       if (apply_cheat_json(title_id, i, 0, apply_err, sizeof(apply_err)) == 0)
         disabled++;
@@ -4543,8 +4418,6 @@ http_route(int fd, const char *method, const char *path, const char *query,
   if (cr_api_patch_profiles_handle(fd, method, path, query, body, body_len)) return;
   if (cr_api_sources_handle(fd, method, path, query, body, body_len)) return;
   if (cr_api_logs_handle(fd, method, path, query, body, body_len)) return;
-  if (cr_api_fan_handle(fd, method, path, query, body, body_len)) return;
-  if (cr_api_profile_handle(fd, method, path, query, body, body_len)) return;
   /* shutdown needs client_ip - handle directly */
   if (!strcmp(path, "/api/dev/shutdown")) {
     handle_api_dev_shutdown(fd, method, query, client_ip);

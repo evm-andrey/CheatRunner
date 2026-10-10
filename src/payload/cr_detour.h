@@ -14,13 +14,14 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.
 
-Ported to from etaHEN's shellui/src/Detour.cpp. Dropped the
-has_hv_bypass/sceKernelMprotect fork; kernel_mprotect is the only path used. */
+kernel_mprotect is the only path used to make the target page writable. */
 
 #pragma once
 
 #include <stdint.h>
 #include <sys/types.h>
+
+#include "cr_hotkey_signal.h"
 
 #define CR_HOOK_LENGTH 14
 
@@ -29,8 +30,11 @@ has_hv_bypass/sceKernelMprotect fork; kernel_mprotect is the only path used. */
 #define CR_DETOUR_ALREADY_HOOKED ((void *)(intptr_t)-1)
 
 void  cr_patch_in_jump(uint64_t address, void *destination);
-void  cr_write_memory(uint64_t address, void *buffer, int length);
 
-/* Hooks `address` to jump to `destination`. Returns a heap trampoline that
- * runs the stolen bytes then jumps back, NULL on failure, or CR_DETOUR_ALREADY_HOOKED if already hooked. */
-void *cr_detour_function(uint64_t address, void *destination);
+/* Builds the trampoline and jump bytes for `address` but does NOT write them; `site` comes back for the
+ * daemon to arm under a process suspend. Returns the trampoline, NULL on failure or CR_DETOUR_ALREADY_HOOKED. */
+void *cr_detour_prepare(uint64_t address, void *destination, cr_hook_site_t *site);
+
+/* Arms a prepared site with one atomic 16-byte compare-and-swap.
+ * Returns 0 and sets site->done, or -1 with the target left untouched. */
+int cr_detour_commit(cr_hook_site_t *site);

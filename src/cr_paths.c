@@ -9,24 +9,9 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
-
-#include <ps5/kernel.h>
-
 #include "cr_paths.h"
 
 static volatile uint32_t g_write_tmp_seq = 0;
-
-/* kernel_get_fw_version() encodes each component as literal hex digits
- * (0x1140 -> "11.40"), so %x formatting (not %u) reproduces it correctly. */
-const char *
-cr_fw_version_string(void) {
-  static char buf[16] = {0};
-  if (!buf[0]) {
-    uint32_t fw = kernel_get_fw_version() >> 16;
-    snprintf(buf, sizeof(buf), "%x.%02x", (fw >> 8) & 0xFF, fw & 0xFF);
-  }
-  return buf;
-}
 
 void
 str_trim(char *s) {
@@ -56,10 +41,11 @@ now_ms(void) {
   return ((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL);
 }
 
-int
-write_file_atomic(const char *path, const uint8_t *data, size_t len) {
+static int
+write_file_impl(const char *path, const uint8_t *data, size_t len, int do_sync) {
   char tmp[512];
   int fd = -1;
+  int saved;
   uint32_t seq = __sync_fetch_and_add(&g_write_tmp_seq, 1u);
   snprintf(tmp, sizeof(tmp), "%s.%u.tmp", path, (unsigned int)seq);
   fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY, 0644);
@@ -67,17 +53,34 @@ write_file_atomic(const char *path, const uint8_t *data, size_t len) {
     return -1;
   }
   if (len > 0 && write(fd, data, len) != (ssize_t)len) {
+    saved = errno;
     close(fd);
     unlink(tmp);
+    errno = saved;
     return -1;
   }
-  fsync(fd);
+  if (do_sync) {
+    fsync(fd);
+  }
   close(fd);
   if (rename(tmp, path) != 0) {
+    saved = errno;
     unlink(tmp);
+    errno = saved;
     return -1;
   }
   return 0;
+}
+
+int
+write_file_atomic(const char *path, const uint8_t *data, size_t len) {
+  return write_file_impl(path, data, len, 1);
+}
+
+/* Same atomic rename, no fsync: for files that can be downloaded again. */
+int
+write_file_fast(const char *path, const uint8_t *data, size_t len) {
+  return write_file_impl(path, data, len, 0);
 }
 
 int

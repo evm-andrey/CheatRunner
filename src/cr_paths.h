@@ -14,6 +14,8 @@
 #define CHEATRUNNER_PATCHES_DIR       "/data/cheatrunner/patches"
 #define CHEATRUNNER_PATCHES_XML_DIR   "/data/cheatrunner/patches/xml"
 #define CHEATRUNNER_PATCHES_PS5_DIR   "/data/cheatrunner/patches/xml_prospero"
+#define CHEATRUNNER_PATCHES_XML_CR_DIR "/data/cheatrunner/patches/xml/cheatrunner"
+#define CHEATRUNNER_PATCHES_PS5_CR_DIR "/data/cheatrunner/patches/xml_prospero/cheatrunner"
 #define ELF_ARSENAL_PATCHES_XML_DIR   "/data/elf-arsenal/patches/xml"
 #define CHEATRUNNER_CACHE_DIR         "/data/cheatrunner/cache"
 #define CHEATRUNNER_CACHE_ICON_DIR    "/data/cheatrunner/cache/icons"
@@ -28,10 +30,7 @@
 #define CHEATRUNNER_NOTIFICATIONS_PATH "/data/cheatrunner/notifications.json"
 #define CHEATRUNNER_ACTIVITY_PATH       "/data/cheatrunner/activity.json"
 #define CHEATRUNNER_CRASH_SUSPECTS_PATH "/data/cheatrunner/crash_suspects.json"
-#define CHEATRUNNER_ADDR_CACHE_PATH     "/data/cheatrunner/addr_cache.json"
-#define CHEATRUNNER_TITLE_PREFS_PATH    "/data/cheatrunner/title_prefs.json"
 #define CHEATRUNNER_FAVORITES_PATH      "/data/cheatrunner/favorites.json"
-#define CHEATRUNNER_FAN_PATH            "/data/cheatrunner/fan.json"
 #define CHEATRUNNER_CHEAT_PROFILES_PATH "/data/cheatrunner/cheat_profiles.json"
 #define CHEATRUNNER_PATCH_PROFILES_PATH "/data/cheatrunner/patch_profiles.json"
 #define CHEATRUNNER_CRASH_LOG_PATH      "/data/cheatrunner/crash.log"
@@ -40,12 +39,9 @@
 void     str_trim(char *s);
 uint64_t now_ms(void);
 
-/* PS5 firmware version, e.g. "11.40" or "4.03". Cached - can't change without
- * a reboot. */
-const char *cr_fw_version_string(void);
-
 /* File I/O */
 int write_file_atomic(const char *path, const uint8_t *data, size_t len);
+int write_file_fast(const char *path, const uint8_t *data, size_t len);
 int read_file_bytes(const char *path, uint8_t **out, size_t *out_len);
 int read_file_text(const char *path, char **out);
 

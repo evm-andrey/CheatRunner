@@ -23,6 +23,12 @@ typedef struct {
   int   skipped;
   int   failed;
   int   verified;
+  int   unchanged;     /* already identical to the repository, not downloaded */
+  unsigned long long bytes;  /* body bytes downloaded this run */
+  unsigned long long dl_start_ms;
+  unsigned long long phase_start_ms;
+  unsigned long long archive_ms;  /* time spent downloading archives */
+  char  phase[16];     /* listing / archive / extract / downloading / done */
   int   missing_count;
   char  missing[REPO_MIRROR_MISSING_MAX][REPO_MIRROR_MISSING_NAME_MAX];
   char  current[128];
@@ -39,8 +45,8 @@ typedef struct {
 
 extern repo_mirror_progress_t g_repo_mirror;
 
-/* Starts a background download for 'source' (hencollection/ps5cheats/goldhen/all);
- * overwrite=0 skips existing files. Returns 0 if started, -1 if already running/invalid. */
+/* Starts a background download for 'source' (a REPOS id or "all"); overwrite=0 skips existing files.
+ * Returns 0 if started, -1 if already running or the source is invalid. */
 int repo_mirror_start(const char *source, int overwrite);
 
 /* Serialise current progress to buf as a JSON object. */

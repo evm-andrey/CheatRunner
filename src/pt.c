@@ -160,11 +160,6 @@ pt_resolve(pid_t pid, const char* nid) {
 }
 
 
-int
-pt_trace_me(void) {
-  return sys_ptrace(PT_TRACE_ME, 0, 0, 0);
-}
-
 
 int
 pt_attach(pid_t pid) {
@@ -193,6 +188,10 @@ pt_attach_timed(pid_t pid, int timeout_ms) {
     int status = 0;
     pid_t wret = waitpid(pid, &status, WNOHANG);
     if(wret == pid) {
+      if(!WIFSTOPPED(status)) {
+        cr_log("warn", "ptrace", "pid=%d didn't stop after PT_ATTACH (status=0x%x)", (int)pid, status);
+        return -1;
+      }
       return 0;
     }
     if(wret == -1) {
@@ -228,70 +227,8 @@ pt_detach(pid_t pid, int sig) {
   return 0;
 }
 
-int
-pt_follow_fork(pid_t pid) {
-  if(sys_ptrace(PT_FOLLOW_FORK, pid, NULL, 1) == -1) {
-    return -1;
-  }
-
-  if(sys_ptrace(PT_LWP_EVENTS, pid, NULL, 1) == -1) {
-    return -1;
-  }
-
-  return 0;
-}
 
 
-int
-pt_follow_exec(pid_t pid) {
-  if(sys_ptrace(PT_LWP_EVENTS, pid, NULL, 1) == -1) {
-    return -1;
-  }
-
-  return 0;
-}
-
-
-pid_t
-pt_await_child(pid_t pid) {
-  struct ptrace_lwpinfo lwpinfo;
-
-  memset(&lwpinfo, 0, sizeof(lwpinfo));
-  while(!(lwpinfo.pl_flags & PL_FLAG_FORKED)) {
-    if(waitpid(pid, NULL, 0) == -1) {
-      return -1;
-    }
-
-    if(sys_ptrace(PT_LWPINFO, pid, (caddr_t)&lwpinfo, sizeof(lwpinfo)) == -1) {
-      return -1;
-    }
-  }
-
-  if(waitpid(lwpinfo.pl_child_pid, NULL, 0) == -1) {
-    return -1;
-  }
-
-  return lwpinfo.pl_child_pid;
-}
-
-
-int
-pt_await_exec(pid_t pid) {
-  struct ptrace_lwpinfo lwpinfo;
-
-  memset(&lwpinfo, 0, sizeof(lwpinfo));
-  while(!(lwpinfo.pl_flags & PL_FLAG_EXEC)) {
-    if(waitpid(pid, NULL, 0) == -1) {
-      return -1;
-    }
-
-    if(sys_ptrace(PT_LWPINFO, pid, (caddr_t)&lwpinfo, sizeof(lwpinfo)) == -1) {
-      return -1;
-    }
-  }
-
-  return 0;
-}
 
 
 int
@@ -380,16 +317,6 @@ pt_copyin(pid_t pid, const void* buf, intptr_t addr, size_t len) {
 }
 
 
-int
-pt_setchar(pid_t pid, intptr_t addr, char val) {
-  return pt_copyin(pid, &val, addr, sizeof(val));
-}
-
-
-int
-pt_setshort(pid_t pid, intptr_t addr, short val) {
-  return pt_copyin(pid, &val, addr, sizeof(val));
-}
 
 
 int
@@ -409,34 +336,7 @@ pt_copyout(pid_t pid, intptr_t addr, void* buf, size_t len) {
 }
 
 
-char
-pt_getchar(pid_t pid, intptr_t addr) {
-  char val = 0;
 
-  pt_copyout(pid, addr, &val, sizeof(val));
-
-  return val;
-}
-
-
-short
-pt_getshort(pid_t pid, intptr_t addr) {
-  short val = 0;
-
-  pt_copyout(pid, addr, &val, sizeof(val));
-
-  return val;
-}
-
-
-long
-pt_getlong(pid_t pid, intptr_t addr) {
-  long val = 0;
-
-  pt_copyout(pid, addr, &val, sizeof(val));
-
-  return val;
-}
 
 
 long
@@ -484,7 +384,6 @@ pt_call(pid_t pid, intptr_t addr, ...) {
     }
   }
 
-  // restore registers
   if(pt_setregs(pid, &bak_reg)) {
     return -1;
   }
@@ -543,7 +442,6 @@ pt_syscall(pid_t pid, int sysno, ...) {
     }
   }
 
-  // restore registers
   if(pt_setregs(pid, &bak_reg)) {
     return -1;
   }
@@ -590,16 +488,6 @@ pt_setsockopt(pid_t pid, int fd, int level, int optname, intptr_t optval,
 			 optlen, 0);
 }
 
-int
-pt_bind(pid_t pid, int sockfd, intptr_t addr, socklen_t addrlen) {
-  return (int)pt_syscall(pid, SYS_bind, sockfd, addr, addrlen);
-}
-
-
-ssize_t
-pt_recvmsg(pid_t pid, int fd, intptr_t msg, int flags) {
-  return (int)pt_syscall(pid, SYS_recvmsg, fd, msg, flags);
-}
 
 
 int
@@ -632,22 +520,6 @@ pt_perror(pid_t pid, const char *s) {
   intptr_t faddr = pt_resolve(pid, "9BcDykPmo1I");
   intptr_t addr = pt_call(pid, faddr);
   int err = pt_getint(pid, addr);
-  /* Was puts() - plain stdout, invisible in klog captures. Every LOG_PT_PERROR
-   * call site in the codebase depends on this actually being visible. */
+  /* Goes through klog because plain stdout is invisible there, and every LOG_PT_PERROR call site relies on it. */
   cr_log("warn", "ptrace", "%s: %s", s, strerror(err));
-}
-
-
-intptr_t
-pt_sceKernelGetProcParam(pid_t pid) {
-  intptr_t faddr = pt_resolve(pid, "959qrazPIrg");
-
-  return pt_call(pid, faddr);
-}
-
-intptr_t
-pt_getargv(pid_t pid) {
-  intptr_t faddr = pt_resolve(pid, "FJmglmTMdr4");
-
-  return pt_call(pid, faddr);
 }

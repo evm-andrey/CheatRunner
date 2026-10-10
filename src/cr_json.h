@@ -5,7 +5,6 @@
 #include "third_party/cJSON.h"
 
 char *json_escape(const char *src);
-int   parse_json_from_body(const char *body, cJSON **out_root);
 
 int json_extract_string(const char *json, const char *key, char *out, size_t out_size);
 int cjson_copy_string(cJSON *item, char *out, size_t out_size);

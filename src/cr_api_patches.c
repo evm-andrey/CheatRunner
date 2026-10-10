@@ -15,7 +15,7 @@
 /* Maximum XML source files to scan per title */
 #define PATCHES_MAX_SOURCES 12
 
-/* Maximum entries across all source files for one title; 128 covers 64 entries x 2 sources, more than any current game. */
+/* Max entries across all source files for one title. */
 #define PATCHES_ALL_MAX 128
 
 static const char *
@@ -429,8 +429,7 @@ handle_patches_apply(int fd, const char *query) {
         free(txt); return;
     }
 
-    /* Mark applied — use the pid patch_apply_entry_ex actually used,
-     * not apply_st.pid which may be stale if the game just launched. */
+    /* Mark applied with the pid patch_apply_entry_ex used; apply_st.pid can be stale right after launch. */
     patch_mark_applied(title_id, e->entry_id, res.pid);
 
     /* Partial-overwrite warning (informational) */
@@ -448,6 +447,7 @@ handle_patches_apply(int fd, const char *query) {
     cJSON_AddStringToObject(ej, "name",        e->name);
     cJSON_AddNumberToObject(ej, "lineCount",   e->line_count);
     cJSON_AddNumberToObject(ej, "verifyFailCount", 0);
+    cJSON_AddNumberToObject(ej, "skippedLines", res.skipped_lines);
     cJSON_AddBoolToObject(ej, "rolledBack",    0);
     cJSON_AddBoolToObject(ej, "hadPartialOverwrite", had_partial_ow);
     if (had_partial_ow)
@@ -480,8 +480,7 @@ handle_patches_restore(int fd, const char *query) {
         return;
     }
 
-    /* Live query — same as patch_apply_entry_ex; avoids 500 ms cache lag from
-     * running_state_get() which would falsely report "no game running". */
+    /* Live query, same as patch_apply_entry_ex; the cached running state lags by up to 500 ms. */
     pid_t pid = -1;
     char running_title[16] = {0};
     intptr_t base = 0;

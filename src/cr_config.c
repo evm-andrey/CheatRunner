@@ -20,28 +20,15 @@ cheatrunner_config_t g_cfg = {
     .launch_kill_delay_ms = 1000,
     .launch_wait_timeout_ms = 60000,
     .cheat_engine = 1,
-    .cheat_validate_original_bytes = 1,
     .cheat_restore_rx = 0,
     .cheat_restore_original_prot = 1,
     .allow_force_enable = 0,
     .cheat_state_after_launch_delay_ms = 8000,
     .launch_post_timeout_grace_ms = 3000,
-    .cheat_address_auto_detect = 1,
     .dev_reload_enabled = 1,
     .dev_shutdown_delay_ms = 700,
-    .theme = "dark",
+    .theme = "midnight",
     .launch_user_id = "auto",
-    .cheat_mc4_address_mode = "auto",
-    .cheat_shn_address_mode = "auto",
-    .allow_unsafe_mc4_apply = 0,
-    .allow_unsafe_shn_apply = 0,
-    .allow_legacy_mc4_without_expected = 1,
-    .allow_legacy_shn_without_expected = 1,
-    /* Relative is correct for most PS5 MC4/SHN files - the old "legacy" magnitude
-     * heuristic (off >= 0x200000 -> absolute) is kept only as an opt-in fallback. */
-    .cheat_mc4_unverified_fallback = "relative",
-    .cheat_shn_unverified_fallback = "relative",
-    .cheat_log_candidates = 0,
     .cheat_post_apply_watch_ms = 8000,
     .cheat_mark_crash_suspect = 1,
     .cheat_apply_one_at_a_time = 1,
@@ -57,14 +44,10 @@ cheatrunner_config_t g_cfg = {
     .title_lookup_timeout_ms = 8000,
     .games_cache_ttl_ms = 30000,
     .appdb_debug_names = 0,
-    .log_level = "info",
-    /* Enabled by default: additive, only engages for MC-dependent mods, so
-     * currently-working cheats are unaffected. */
+    .log_level = "debug",
+    /* On by default: only engages for MC-dependent mods, so working cheats are unaffected. */
     .cheat_master_code_fixup = 1,
-    .cheat_addr_cache_enabled = 1,
     .cheat_inter_mod_delay_ms = 0,
-    .fan_min_c = 30,
-    .fan_max_c = 90,
     .tile_autoinstall_enabled = 1,
     .hotkey_enabled = 0,
     .hotkey_button_a = "L2",
@@ -85,26 +68,15 @@ config_set_defaults(cheatrunner_config_t *cfg) {
       .launch_kill_delay_ms = 1000,
       .launch_wait_timeout_ms = 60000,
       .cheat_engine = 1,
-      .cheat_validate_original_bytes = 1,
       .cheat_restore_rx = 0,
       .cheat_restore_original_prot = 1,
       .allow_force_enable = 0,
       .cheat_state_after_launch_delay_ms = 8000,
       .launch_post_timeout_grace_ms = 3000,
-      .cheat_address_auto_detect = 1,
       .dev_reload_enabled = 1,
       .dev_shutdown_delay_ms = 700,
-      .theme = "dark",
+      .theme = "midnight",
       .launch_user_id = "auto",
-      .cheat_mc4_address_mode = "auto",
-      .cheat_shn_address_mode = "auto",
-      .allow_unsafe_mc4_apply = 0,
-      .allow_unsafe_shn_apply = 0,
-      .allow_legacy_mc4_without_expected = 1,
-      .allow_legacy_shn_without_expected = 1,
-      .cheat_mc4_unverified_fallback = "relative",
-      .cheat_shn_unverified_fallback = "relative",
-      .cheat_log_candidates = 0,
       .cheat_post_apply_watch_ms = 8000,
       .cheat_mark_crash_suspect = 1,
       .cheat_apply_one_at_a_time = 1,
@@ -120,12 +92,9 @@ config_set_defaults(cheatrunner_config_t *cfg) {
       .title_lookup_timeout_ms = 8000,
       .games_cache_ttl_ms = 30000,
       .appdb_debug_names = 0,
-      .log_level = "info",
+      .log_level = "debug",
       .cheat_master_code_fixup = 0,
-      .cheat_addr_cache_enabled = 1,
       .cheat_inter_mod_delay_ms = 0,
-      .fan_min_c = 30,
-      .fan_max_c = 90,
       .tile_autoinstall_enabled = 1,
       .hotkey_enabled = 0,
       .hotkey_button_a = "L2",
@@ -146,22 +115,11 @@ config_save_locked(void) {
       "launch_kill_delay_ms=%d\n"
       "launch_wait_timeout_ms=%d\n"
       "cheat_engine=%d\n"
-      "cheat_validate_original_bytes=%d\n"
       "cheat_restore_rx=%d\n"
       "cheat_restore_original_prot=%d\n"
       "allow_force_enable=%d\n"
       "cheat_state_after_launch_delay_ms=%d\n"
       "launch_post_timeout_grace_ms=%d\n"
-      "cheat_address_auto_detect=%d\n"
-      "cheat_mc4_address_mode=%s\n"
-      "cheat_shn_address_mode=%s\n"
-      "allow_unsafe_mc4_apply=%d\n"
-      "allow_unsafe_shn_apply=%d\n"
-      "allow_legacy_mc4_without_expected=%d\n"
-      "allow_legacy_shn_without_expected=%d\n"
-      "cheat_mc4_unverified_fallback=%s\n"
-      "cheat_shn_unverified_fallback=%s\n"
-      "cheat_log_candidates=%d\n"
       "launch_user_id=%s\n"
       "dev_reload_enabled=%d\n"
       "dev_shutdown_delay_ms=%d\n"
@@ -182,10 +140,7 @@ config_save_locked(void) {
       "appdb_debug_names=%d\n"
       "log_level=%s\n"
       "cheat_master_code_fixup=%d\n"
-      "cheat_addr_cache_enabled=%d\n"
       "cheat_inter_mod_delay_ms=%d\n"
-      "fan_min_c=%d\n"
-      "fan_max_c=%d\n"
       "tile_autoinstall_enabled=%d\n"
       "hotkey_enabled=%d\n"
       "hotkey_button_a=%s\n"
@@ -195,15 +150,11 @@ config_save_locked(void) {
       g_cfg.http_port, g_cfg.auto_load_cheat_menu,
       g_cfg.auto_download_missing_cheat, g_cfg.launch_kill_current,
       g_cfg.launch_kill_delay_ms, g_cfg.launch_wait_timeout_ms,
-      g_cfg.cheat_engine, g_cfg.cheat_validate_original_bytes,
+      g_cfg.cheat_engine,
       g_cfg.cheat_restore_rx, g_cfg.cheat_restore_original_prot,
       g_cfg.allow_force_enable,
-      g_cfg.cheat_state_after_launch_delay_ms, g_cfg.launch_post_timeout_grace_ms, g_cfg.cheat_address_auto_detect,
-      g_cfg.cheat_mc4_address_mode, g_cfg.cheat_shn_address_mode,
-      g_cfg.allow_unsafe_mc4_apply, g_cfg.allow_unsafe_shn_apply,
-      g_cfg.allow_legacy_mc4_without_expected, g_cfg.allow_legacy_shn_without_expected,
-      g_cfg.cheat_mc4_unverified_fallback, g_cfg.cheat_shn_unverified_fallback,
-      g_cfg.cheat_log_candidates, g_cfg.launch_user_id,
+      g_cfg.cheat_state_after_launch_delay_ms, g_cfg.launch_post_timeout_grace_ms,
+      g_cfg.launch_user_id,
       g_cfg.dev_reload_enabled, g_cfg.dev_shutdown_delay_ms,
       g_cfg.cheat_post_apply_watch_ms, g_cfg.cheat_mark_crash_suspect,
       g_cfg.cheat_apply_one_at_a_time, g_cfg.cheat_apply_cooldown_ms,
@@ -214,11 +165,9 @@ config_save_locked(void) {
       g_cfg.title_lookup_enabled, g_cfg.title_lookup_cache_enabled, g_cfg.title_lookup_timeout_ms,
       g_cfg.games_cache_ttl_ms, g_cfg.appdb_debug_names, g_cfg.log_level,
       g_cfg.cheat_master_code_fixup,
-      g_cfg.cheat_addr_cache_enabled, g_cfg.cheat_inter_mod_delay_ms,
-      g_cfg.fan_min_c, g_cfg.fan_max_c,
+      g_cfg.cheat_inter_mod_delay_ms,
       g_cfg.tile_autoinstall_enabled,
-      g_cfg.hotkey_enabled,
-      g_cfg.hotkey_button_a, g_cfg.hotkey_button_b, g_cfg.hotkey_hold_ms,
+      g_cfg.hotkey_enabled, g_cfg.hotkey_button_a, g_cfg.hotkey_button_b, g_cfg.hotkey_hold_ms,
       g_cfg.theme);
   if (n <= 0 || (size_t)n >= sizeof(txt)) {
     return -1;
@@ -256,8 +205,15 @@ config_load(void) {
     } else if (!strcmp(k, "rpc_port") || !strcmp(k, "rpc_legacy_enabled") ||
                !strcmp(k, "rpc_json_enabled") || !strcmp(k, "rpc_legacy_port") ||
                !strcmp(k, "rpc_json_port") || !strcmp(k, "rpc_heartbeat_sec") ||
-               !strcmp(k, "rpc_emit_cheat_events")) {
-      /* removed — silently ignore */
+               !strcmp(k, "rpc_emit_cheat_events") ||
+               !strcmp(k, "cheat_validate_original_bytes") || !strcmp(k, "cheat_address_auto_detect") ||
+               !strcmp(k, "cheat_mc4_address_mode") || !strcmp(k, "cheat_shn_address_mode") ||
+               !strcmp(k, "allow_unsafe_mc4_apply") || !strcmp(k, "allow_unsafe_shn_apply") ||
+               !strcmp(k, "allow_legacy_mc4_without_expected") || !strcmp(k, "allow_legacy_shn_without_expected") ||
+               !strcmp(k, "cheat_mc4_unverified_fallback") || !strcmp(k, "cheat_shn_unverified_fallback") ||
+               !strcmp(k, "cheat_log_candidates") || !strcmp(k, "cheat_addr_cache_enabled") ||
+               !strcmp(k, "share_hotkey_enabled") || !strcmp(k, "share_hotkey_hold_ms")) {
+      /* Ignore removed settings so existing config files still load. */
     } else if (!strcmp(k, "auto_load_cheat_menu")) {
       g_cfg.auto_load_cheat_menu = atoi(v) ? 1 : 0;
     } else if (!strcmp(k, "auto_download_missing_cheat")) {
@@ -270,10 +226,8 @@ config_load(void) {
       g_cfg.launch_wait_timeout_ms = atoi(v);
     } else if (!strcmp(k, "cheat_engine")) {
       g_cfg.cheat_engine = atoi(v) ? 1 : 0;
-    } else if (!strcmp(k, "cheat_validate_original_bytes")) {
-      g_cfg.cheat_validate_original_bytes = atoi(v) ? 1 : 0;
     } else if (!strcmp(k, "cheat_restore_rx")) {
-      g_cfg.cheat_restore_rx = atoi(v) ? 1 : 0;  /* legacy: kept for compat; default is now 0 */
+      g_cfg.cheat_restore_rx = atoi(v) ? 1 : 0;  /* Old key, still accepted; off by default. */
     } else if (!strcmp(k, "cheat_restore_original_prot")) {
       g_cfg.cheat_restore_original_prot = atoi(v) ? 1 : 0;
     } else if (!strcmp(k, "allow_force_enable")) {
@@ -282,26 +236,6 @@ config_load(void) {
       g_cfg.cheat_state_after_launch_delay_ms = atoi(v);
     } else if (!strcmp(k, "launch_post_timeout_grace_ms")) {
       g_cfg.launch_post_timeout_grace_ms = atoi(v);
-    } else if (!strcmp(k, "cheat_address_auto_detect")) {
-      g_cfg.cheat_address_auto_detect = atoi(v) ? 1 : 0;
-    } else if (!strcmp(k, "cheat_mc4_address_mode")) {
-      snprintf(g_cfg.cheat_mc4_address_mode, sizeof(g_cfg.cheat_mc4_address_mode), "%s", v);
-    } else if (!strcmp(k, "cheat_shn_address_mode")) {
-      snprintf(g_cfg.cheat_shn_address_mode, sizeof(g_cfg.cheat_shn_address_mode), "%s", v);
-    } else if (!strcmp(k, "allow_unsafe_mc4_apply")) {
-      g_cfg.allow_unsafe_mc4_apply = atoi(v) ? 1 : 0;
-    } else if (!strcmp(k, "allow_unsafe_shn_apply")) {
-      g_cfg.allow_unsafe_shn_apply = atoi(v) ? 1 : 0;
-    } else if (!strcmp(k, "allow_legacy_mc4_without_expected")) {
-      g_cfg.allow_legacy_mc4_without_expected = atoi(v) ? 1 : 0;
-    } else if (!strcmp(k, "allow_legacy_shn_without_expected")) {
-      g_cfg.allow_legacy_shn_without_expected = atoi(v) ? 1 : 0;
-    } else if (!strcmp(k, "cheat_mc4_unverified_fallback")) {
-      snprintf(g_cfg.cheat_mc4_unverified_fallback, sizeof(g_cfg.cheat_mc4_unverified_fallback), "%s", v);
-    } else if (!strcmp(k, "cheat_shn_unverified_fallback")) {
-      snprintf(g_cfg.cheat_shn_unverified_fallback, sizeof(g_cfg.cheat_shn_unverified_fallback), "%s", v);
-    } else if (!strcmp(k, "cheat_log_candidates")) {
-      g_cfg.cheat_log_candidates = atoi(v) ? 1 : 0;
     } else if (!strcmp(k, "launch_user_id")) {
       snprintf(g_cfg.launch_user_id, sizeof(g_cfg.launch_user_id), "%s", v);
     } else if (!strcmp(k, "cheat_post_apply_watch_ms")) {
@@ -339,11 +273,9 @@ config_load(void) {
     } else if (!strcmp(k, "appdb_debug_names")) {
       g_cfg.appdb_debug_names = atoi(v) ? 1 : 0;
     } else if (!strcmp(k, "log_level")) {
-      snprintf(g_cfg.log_level, sizeof(g_cfg.log_level), "%s", v);
+      /* Always starts at debug; a change in Settings lasts until the next start. */
     } else if (!strcmp(k, "cheat_master_code_fixup")) {
       g_cfg.cheat_master_code_fixup = atoi(v) ? 1 : 0;
-    } else if (!strcmp(k, "cheat_addr_cache_enabled")) {
-      g_cfg.cheat_addr_cache_enabled = atoi(v) ? 1 : 0;
     } else if (!strcmp(k, "cheat_inter_mod_delay_ms")) {
       int cv = atoi(v);
       g_cfg.cheat_inter_mod_delay_ms = (cv >= 0 && cv <= 10000) ? cv : 0;
@@ -360,25 +292,17 @@ config_load(void) {
     } else if (!strcmp(k, "hotkey_hold_ms")) {
       int cv = atoi(v);
       g_cfg.hotkey_hold_ms = (cv >= 100 && cv <= 5000) ? cv : 800;
-    } else if (!strncmp(k, "hotkey_", 7)) {
-      /* removed — silently ignore */
     } else if (!strcmp(k, "klog_enabled") || !strcmp(k, "klog_host") ||
                !strcmp(k, "klog_port") || !strcmp(k, "klog_ring_capacity")) {
-      /* deprecated — silently ignore */
+      /* Ignore deprecated settings in existing config files. */
     } else if (!strcmp(k, "dev_reload_enabled")) {
       g_cfg.dev_reload_enabled = atoi(v) ? 1 : 0;
     } else if (!strcmp(k, "dev_reload_token")) {
-      /* removed — silently ignore */
+      /* Ignore removed settings so existing config files still load. */
     } else if (!strcmp(k, "dev_shutdown_delay_ms")) {
       g_cfg.dev_shutdown_delay_ms = atoi(v);
     } else if (!strcmp(k, "theme")) {
       snprintf(g_cfg.theme, sizeof(g_cfg.theme), "%s", v);
-    } else if (!strcmp(k, "fan_min_c")) {
-      int cv = atoi(v);
-      g_cfg.fan_min_c = (cv >= 10 && cv <= 60) ? cv : 30;
-    } else if (!strcmp(k, "fan_max_c")) {
-      int cv = atoi(v);
-      g_cfg.fan_max_c = (cv >= 50 && cv <= 100) ? cv : 90;
     } else if (!strcmp(k, "tile_autoinstall_enabled")) {
       g_cfg.tile_autoinstall_enabled = atoi(v) ? 1 : 0;
     }
@@ -410,20 +334,20 @@ config_load(void) {
   if (g_cfg.title_lookup_timeout_ms < 1000 || g_cfg.title_lookup_timeout_ms > 30000) {
     g_cfg.title_lookup_timeout_ms = 8000;
   }
+  if (g_cfg.games_cache_ttl_ms < 1000 || g_cfg.games_cache_ttl_ms > 300000) {
+    g_cfg.games_cache_ttl_ms = 30000;
+  }
+  g_cfg.appdb_debug_names = g_cfg.appdb_debug_names ? 1 : 0;
   if (!strcmp(g_cfg.hotkey_button_a, g_cfg.hotkey_button_b)) {
     cr_log("warn", "config", "hotkey_button_a and hotkey_button_b are the same, resetting to defaults");
     snprintf(g_cfg.hotkey_button_a, sizeof(g_cfg.hotkey_button_a), "%s", "L2");
     snprintf(g_cfg.hotkey_button_b, sizeof(g_cfg.hotkey_button_b), "%s", "R3");
   }
-  if (g_cfg.games_cache_ttl_ms < 1000 || g_cfg.games_cache_ttl_ms > 300000) {
-    g_cfg.games_cache_ttl_ms = 30000;
-  }
-  g_cfg.appdb_debug_names = g_cfg.appdb_debug_names ? 1 : 0;
   if (strcasecmp(g_cfg.log_level, "debug") != 0 &&
       strcasecmp(g_cfg.log_level, "info") != 0 &&
       strcasecmp(g_cfg.log_level, "warn") != 0 &&
       strcasecmp(g_cfg.log_level, "error") != 0) {
-    snprintf(g_cfg.log_level, sizeof(g_cfg.log_level), "%s", "info");
+    snprintf(g_cfg.log_level, sizeof(g_cfg.log_level), "%s", "debug");
   }
   cr_log_set_level(g_cfg.log_level);
   pthread_mutex_unlock(&g_cfg_lock);
@@ -441,14 +365,4 @@ config_check_reload(void) {
   if (st.st_mtime == last_mtime) return;
   cr_log("info", "config", "config file changed on disk, reloading");
   config_load();
-}
-
-void
-cfg_get_cheat_remote_opts(int *sources_enabled, int *download_enabled, int *ttl_sec, int *max_bytes) {
-  pthread_mutex_lock(&g_cfg_lock);
-  if (sources_enabled) *sources_enabled = g_cfg.cheat_sources_enabled;
-  if (download_enabled) *download_enabled = g_cfg.cheat_remote_download_enabled;
-  if (ttl_sec) *ttl_sec = g_cfg.cheat_source_cache_ttl_seconds;
-  if (max_bytes) *max_bytes = g_cfg.cheat_remote_max_file_bytes;
-  pthread_mutex_unlock(&g_cfg_lock);
 }

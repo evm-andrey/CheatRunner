@@ -11,7 +11,6 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
 #include "cr_api.h"
@@ -185,8 +184,7 @@ http_grow_buf(char **buf, size_t *cap, size_t need) {
 
 static void
 http_handle_client(int fd, const char *client_ip) {
-  /* Most requests (polling, toggles) are a few KB — start small and grow only
-   * for the rare large upload, instead of malloc'ing MAX_REQ_SIZE every time. */
+  /* Most requests are a few KB: start small and grow only for large uploads. */
   size_t cap = 65536;
   char *req = malloc(cap + 1);
   if (!req) {
@@ -255,8 +253,7 @@ http_handle_client(int fd, const char *client_ip) {
     free(req);
     return;
   }
-  /* Headers parsed — grow straight to the full known size up front, since
-   * pointers taken before a realloc would otherwise dangle. */
+  /* Headers parsed: grow to the full size now, since pointers taken before a realloc would dangle. */
   if (http_grow_buf(&req, &cap, used + content_len) != 0) {
     http_send_json(fd, 500, "{\"ok\":false,\"error\":\"alloc\"}");
     free(req);
@@ -321,7 +318,6 @@ close_fd_safe(int *fd) {
 void *
 http_server_thread(void *arg) {
   (void)arg;
-  syscall(SYS_thr_set_name, -1, "CheatRunner.elf");
   int http_port = CHEATRUNNER_HTTP_PORT;
   int bind_fails = 0;
   pthread_mutex_lock(&g_cfg_lock);
@@ -341,8 +337,8 @@ http_server_thread(void *arg) {
 
     int opt = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR,  &opt, sizeof(opt));
-    /* SO_REUSEPORT lets a new instance bind immediately even if a SIGKILL'd old process is still alive in kernel sleep. */
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    /* Must be set before bind()/listen(); too late after accept() on ProsperoOS. */
+    { int rcvbuf = 4 * 1024 * 1024; setsockopt(listen_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)); }
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -353,8 +349,8 @@ http_server_thread(void *arg) {
       int be = errno;
       close(listen_fd);
       bind_fails++;
-      /* EADDRINUSE almost always means a previous CheatRunner still holds the port
-       * (SO_REUSEADDR can't reclaim a live listener) - warn once, keep retrying. */
+      /* EADDRINUSE almost always means a previous CheatRunner still holds the port (SO_REUSEADDR cannot
+       * reclaim a live listener); warn once, then keep retrying. */
       if (bind_fails <= 5) {
         log_msg("[HTTP] bind() failed on %d: %d", http_port, be);
       }
@@ -409,12 +405,13 @@ http_server_thread(void *arg) {
         if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
           continue;
         }
-        /* Non-transient error (e.g. network dropped during sleep mode) —
-         * break to outer loop so the socket is closed and recreated. */
+        /* Non-transient error (e.g. network dropped in sleep mode): break out so the socket is recreated. */
         log_msg("[HTTP] accept() failed: %d — reopening socket", errno);
         break;
       }
       { int nd = 1; setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd)); }
+      /* The ProsperoOS default SNDBUF caps outbound throughput; set it on each accepted socket. */
+      { int sndbuf = 4 * 1024 * 1024; setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)); }
       char client_ip[64] = {0};
       inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
 
@@ -469,8 +466,7 @@ http_server_thread(void *arg) {
   return NULL;
 }
 
-/* SIGCONT fires when the PS5 wakes from standby — accept() may otherwise
- * keep blocking on a stale socket for a while before erroring out. */
+/* SIGCONT means wake from standby; accept() could otherwise block on a stale socket for a while. */
 static volatile sig_atomic_t g_net_resume_flag = 0;
 
 static void
@@ -479,12 +475,11 @@ net_resume_sighandler(int sig) {
   g_net_resume_flag = 1;
 }
 
-/* Watches for IP changes / console resume so the accept() loop's socket-recreate
- * path (above) triggers proactively instead of waiting on accept() to error out. */
+/* Watches for IP changes and console resume, so the accept() loop recreates its socket early
+ * instead of waiting for an error. */
 void *
 http_net_watchdog_thread(void *arg) {
   (void)arg;
-  syscall(SYS_thr_set_name, -1, "CheatRunner.elf");
   signal(SIGCONT, net_resume_sighandler);
   char last_ip[64] = "";
   while (!g_shutdown_requested) {

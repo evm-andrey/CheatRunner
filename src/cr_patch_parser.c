@@ -201,8 +201,7 @@ patch_restore_entry(const char *title_id, const char *entry_id, pid_t pid,
         }
         return -1;
     }
-    /* Heap-allocate the backup copy — the struct is ~17 KB (64 lines × 272 bytes)
-     * and would overflow the thread stack if placed as a local variable. */
+    /* Heap-allocate the backup (~17 KB); as a local it would overflow the thread stack. */
     patch_backup_rec_t *rec = malloc(sizeof(*rec));
     if (!rec) {
         pthread_mutex_unlock(&g_patch_backup_lock);
@@ -219,8 +218,7 @@ patch_restore_entry(const char *title_id, const char *entry_id, pid_t pid,
     pthread_mutex_lock(&g_cheat_apply_lock);
     g_cheat_applying = 1;
 
-    /* write_process_memory_forced is mdbg-backed and needs no ptrace attach,
-     * so just confirm the process is still alive before writing. */
+    /* mdbg writes need no ptrace attach; just confirm the process is still alive. */
     if (kill(pid, 0) != 0 && errno == ESRCH) {
         g_cheat_applying = 0;
         pthread_mutex_unlock(&g_cheat_apply_lock);
@@ -289,7 +287,7 @@ patch_restore_all_for_pid(pid_t pid, const char *title_id) {
 
     /* Quick liveness check — by the time game-stop fires, the process is usually dead. */
     if (kill(pid, 0) != 0 && errno == ESRCH) {
-        cr_log("warn", "patches",
+        cr_log("info", "patches",
                "game_stop: pid=%d already dead — %d patch(es) not restored (bytes gone with process)",
                (int)pid, count);
         patch_clear_backups_for_pid(pid);
@@ -387,12 +385,35 @@ typedef struct {
     char                   title_id[16];
     char                   path[384];
     cr_patch_source_kind_t kind;
+    int                    prio;   /* from CheatRunner_Patches, wins over other sources */
 } idx_entry_t;
 
 static idx_entry_t     g_idx[PATCH_NAME_DIR_MAX];
 static int             g_idx_n     = 0;
 static int             g_idx_built = 0;
+static time_t          g_idx_sig   = 0;
 static pthread_mutex_t g_idx_lock  = PTHREAD_MUTEX_INITIALIZER;
+
+/* Changes whenever a file is added to or removed from any patch folder. */
+static time_t
+patch_dirs_signature(void) {
+    static const char *const dirs[] = {CHEATRUNNER_PATCHES_PS5_DIR, CHEATRUNNER_PATCHES_XML_DIR, ELF_ARSENAL_PATCHES_XML_DIR, CHEATRUNNER_PATCHES_DIR};
+    time_t sig = 0;
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        struct stat st;
+        if (stat(dirs[i], &st) == 0) sig = sig * 31 + st.st_mtime;
+    }
+    return sig;
+}
+
+/* Rebuilds the index on the next lookup without forgetting which patches are applied. */
+void
+patch_index_refresh(void) {
+    pthread_mutex_lock(&g_idx_lock);
+    g_idx_built = 0;
+    g_idx_n     = 0;
+    pthread_mutex_unlock(&g_idx_lock);
+}
 
 void
 patch_index_invalidate(void) {
@@ -412,6 +433,7 @@ static const struct {
     { CHEATRUNNER_PATCHES_PS5_DIR, "cheatrunner_ps5" },
     { CHEATRUNNER_PATCHES_XML_DIR, "cheatrunner_xml"  },
     { ELF_ARSENAL_PATCHES_XML_DIR, "elf_arsenal_xml"  },
+    { CHEATRUNNER_PATCHES_DIR,     "cheatrunner_xml"  },
 };
 #define K_PF_NDIRS ((int)(sizeof(k_pf_dirs)/sizeof(k_pf_dirs[0])))
 
@@ -446,8 +468,8 @@ patch_files_list_json(void) {
         while ((de = readdir(d))) {
             const char *n = de->d_name;
             size_t nl = strlen(n);
-            int is_xml = (nl > 4  && strcmp(n + nl - 4, ".xml")     == 0);
-            int is_off = (nl > 8  && strcmp(n + nl - 8, ".xml.off") == 0);
+            int is_xml = (nl > 4  && strcasecmp(n + nl - 4, ".xml")     == 0);
+            int is_off = (nl > 8  && strcasecmp(n + nl - 8, ".xml.off") == 0);
             if (!is_xml && !is_off) continue;
 
             /* display name strips the extension */
@@ -536,8 +558,8 @@ patch_file_delete(const char *name, int dir_idx) {
     return unlink(path) == 0 ? 0 : -1;
 }
 
-/* Extract all <ID>...</ID> values from the <TitleID> block and add (id, path, kind)
- * entries to the index.  Allows duplicate (title_id, path) pairs to be skipped. */
+/* Adds every <ID> in the <TitleID> block to the index as (id, path, kind); duplicate (title_id, path)
+ * pairs are skipped. */
 static void
 index_xml_file(const char *xml_path, cr_patch_source_kind_t kind,
                const char *xml_text) {
@@ -568,6 +590,7 @@ index_xml_file(const char *xml_path, cr_patch_source_kind_t kind,
                 snprintf(g_idx[g_idx_n].title_id, 16,             "%s", tid);
                 snprintf(g_idx[g_idx_n].path,     sizeof(g_idx[0].path), "%s", xml_path);
                 g_idx[g_idx_n].kind = kind;
+                g_idx[g_idx_n].prio = strstr(xml_path, "/xml/cheatrunner/") || strstr(xml_path, "/xml_prospero/cheatrunner/");
                 g_idx_n++;
             }
         }
@@ -581,29 +604,42 @@ cmp_strbuf(const void *a, const void *b) {
     return strcmp((const char *)a, (const char *)b);
 }
 
-#define DIRSCAN_MAX  512
+#define DIRSCAN_MAX  1024
 #define DIRSCAN_NAME 256
+#define DIRSCAN_SUBS 64
+#define DIRSCAN_DEPTH 2
 
+/* Indexes every .xml in dir and in its subfolders (a downloaded repo is often dropped in as a folder). */
 static void
-scan_dir_into_index(const char *dir, cr_patch_source_kind_t kind) {
+scan_dir_into_index(const char *dir, cr_patch_source_kind_t kind, int depth) {
     DIR *dp = opendir(dir);
     if (!dp) {
-        cr_log("info", "patches", "scan_dir: %s not found or not accessible", dir);
+        cr_log("debug", "patches", "scan_dir: %s not found or not accessible", dir);
         return;
     }
 
-    /* Collect filenames, then sort alphabetically for deterministic order. */
-    static char names[DIRSCAN_MAX][DIRSCAN_NAME];
-    int ncount = 0;
+    char (*names)[DIRSCAN_NAME] = calloc(DIRSCAN_MAX, DIRSCAN_NAME);
+    char (*subs)[DIRSCAN_NAME] = calloc(DIRSCAN_SUBS, DIRSCAN_NAME);
+    if (!names || !subs) {
+        free(names);
+        free(subs);
+        closedir(dp);
+        return;
+    }
+    int ncount = 0, scount = 0, dropped = 0;
 
     struct dirent *ent;
     while ((ent = readdir(dp)) != NULL) {
-        if (!ends_with_case(ent->d_name, ".xml")) continue;
-        if (!is_safe_filename(ent->d_name)) continue;
-        if (ncount < DIRSCAN_MAX)
-            snprintf(names[ncount++], DIRSCAN_NAME, "%s", ent->d_name);
+        if (ent->d_name[0] == '.') continue;
+        if (ends_with_case(ent->d_name, ".xml")) {
+            if (ncount < DIRSCAN_MAX) snprintf(names[ncount++], DIRSCAN_NAME, "%s", ent->d_name);
+            else dropped++;
+        } else if (depth > 0 && scount < DIRSCAN_SUBS && ent->d_type == DT_DIR) {
+            snprintf(subs[scount++], DIRSCAN_NAME, "%s", ent->d_name);
+        }
     }
     closedir(dp);
+    if (dropped) cr_log("warn", "patches", "scan_dir: %s has %d more .xml file(s) than the %d that are read", dir, dropped, DIRSCAN_MAX);
 
     qsort(names, (size_t)ncount, DIRSCAN_NAME, cmp_strbuf);
 
@@ -624,16 +660,27 @@ scan_dir_into_index(const char *dir, cr_patch_source_kind_t kind) {
         }
         index_xml_file(full, kind, buf);
     }
+    free(names);
+
+    for (int si = 0; si < scount; si++) {
+        char sub[512];
+        snprintf(sub, sizeof(sub), "%s/%s", dir, subs[si]);
+        scan_dir_into_index(sub, kind, depth - 1);
+    }
+    free(subs);
 }
 
 static void
 build_index(void) {
     g_idx_n = 0;
-    scan_dir_into_index(CHEATRUNNER_PATCHES_PS5_DIR, CR_PATCH_SOURCE_CHEATRUNNER_PS5);
-    scan_dir_into_index(CHEATRUNNER_PATCHES_XML_DIR,  CR_PATCH_SOURCE_CHEATRUNNER_XML);
-    scan_dir_into_index(ELF_ARSENAL_PATCHES_XML_DIR,  CR_PATCH_SOURCE_ELF_ARSENAL_XML);
+    scan_dir_into_index(CHEATRUNNER_PATCHES_PS5_DIR, CR_PATCH_SOURCE_CHEATRUNNER_PS5, DIRSCAN_DEPTH);
+    scan_dir_into_index(CHEATRUNNER_PATCHES_XML_DIR,  CR_PATCH_SOURCE_CHEATRUNNER_XML, DIRSCAN_DEPTH);
+    scan_dir_into_index(ELF_ARSENAL_PATCHES_XML_DIR,  CR_PATCH_SOURCE_ELF_ARSENAL_XML, DIRSCAN_DEPTH);
+    /* Loose files only; xml/ and xml_prospero/ are already scanned above. */
+    scan_dir_into_index(CHEATRUNNER_PATCHES_DIR,      CR_PATCH_SOURCE_CHEATRUNNER_XML, 0);
     g_idx_built = 1;
-    cr_log("info", "patches", "index built: %d entry/file pair(s)", g_idx_n);
+    g_idx_sig = patch_dirs_signature();
+    cr_log("debug", "patches", "index built: %d entry/file pair(s)", g_idx_n);
 }
 
 int
@@ -642,10 +689,13 @@ patch_find_xmls_for_title(const char *title_id,
                           int max) {
     if (!title_id || !out_paths || !out_kinds || max <= 0) return 0;
     pthread_mutex_lock(&g_idx_lock);
-    if (!g_idx_built) build_index();
+    if (!g_idx_built || g_idx_sig != patch_dirs_signature()) build_index();
     int found = 0;
+    int has_prio = 0;
+    for (int i = 0; i < g_idx_n; i++)
+        if (g_idx[i].prio && strcmp(g_idx[i].title_id, title_id) == 0) has_prio = 1;
     for (int i = 0; i < g_idx_n && found < max; i++) {
-        if (strcmp(g_idx[i].title_id, title_id) == 0) {
+        if (strcmp(g_idx[i].title_id, title_id) == 0 && (!has_prio || g_idx[i].prio)) {
             snprintf(out_paths[found], 384, "%s", g_idx[i].path);
             out_kinds[found] = g_idx[i].kind;
             found++;
@@ -778,11 +828,14 @@ parse_hex_bytes(const char *s, uint8_t *out, size_t *out_len, size_t max) {
     return 0;
 }
 
+/* A bytes value can be longer than one line holds; it is split into several lines when parsed. */
+#define PATCH_VALUE_MAX 4096
+
 static int
 parse_typed_value(const char *type_str, const char *val_str,
                   uint8_t *out, size_t *out_len) {
     if (strcmp(type_str, "bytes") == 0 || strcmp(type_str, "byte") == 0)
-        return parse_hex_bytes(val_str, out, out_len, PATCH_LINE_MAX_BYTES);
+        return parse_hex_bytes(val_str, out, out_len, PATCH_VALUE_MAX);
 
     if (strcmp(type_str, "bytes16") == 0) {
         uint64_t v = strtoull(val_str, NULL, 0);
@@ -932,7 +985,7 @@ patch_parse_xml_file(const char *xml_path, const char *title_id,
 
                 char type_str[32]   = {0};
                 char addr_str[1024] = {0};
-                char val_str[512]   = {0};
+                char val_str[PATCH_VALUE_MAX * 2 + 4] = {0};
                 char off_str[16]    = {0};
                 char target_str[512] = {0};
                 char size_str[16]   = {0};
@@ -980,8 +1033,8 @@ patch_parse_xml_file(const char *xml_path, const char *title_id,
                     ln->value_len = vlen;
                     memcpy(ln->value, vbuf, vlen);
                 } else if (lt == PATCH_LINE_MASK_JUMP32) {
-                    /* Detour trampoline: Address/Offset locate the hook site, Target locates the
-                     * cave via a second independent scan, Value is written into the cave, not the hook. */
+                    /* Detour trampoline: Address/Offset locate the hook site (pattern scan like mask), Target locates the
+                     * cave with a second scan, and Value is written into the cave, not at the hook site. */
                     if (!target_str[0]) { lp = line_end + 2; continue; }
                     int plen = parse_mask_pattern(addr_str, ln->pattern, ln->wildcard,
                                                   PATCH_MASK_MAX_BYTES);
@@ -1009,13 +1062,24 @@ patch_parse_xml_file(const char *xml_path, const char *title_id,
                     uint64_t raw_addr = strtoull(addr_str, NULL, 16);
                     ln->offset = imagebase ? (intptr_t)(raw_addr - (uint64_t)imagebase)
                                            : (intptr_t)raw_addr;
-                    uint8_t vbuf[PATCH_LINE_MAX_BYTES];
+                    uint8_t vbuf[PATCH_VALUE_MAX];
                     size_t  vlen = 0;
                     if (parse_typed_value(type_str, val_str, vbuf, &vlen) != 0 || vlen == 0) {
                         lp = line_end + 2; continue;
                     }
-                    ln->value_len = vlen;
-                    memcpy(ln->value, vbuf, vlen);
+                    size_t first = vlen < PATCH_LINE_MAX_BYTES ? vlen : PATCH_LINE_MAX_BYTES;
+                    ln->value_len = first;
+                    memcpy(ln->value, vbuf, first);
+                    for (size_t done = first; done < vlen && e->line_count + 1 < PATCH_MAX_LINES; done += PATCH_LINE_MAX_BYTES) {
+                        size_t n = vlen - done < PATCH_LINE_MAX_BYTES ? vlen - done : PATCH_LINE_MAX_BYTES;
+                        e->line_count++;
+                        patch_line_t *more = &e->lines[e->line_count];
+                        memset(more, 0, sizeof(*more));
+                        more->type = lt;
+                        more->offset = ln->offset + (intptr_t)done;
+                        more->value_len = n;
+                        memcpy(more->value, vbuf + done, n);
+                    }
                 }
 
                 e->line_count++;
@@ -1077,8 +1141,8 @@ scan_for_pattern(pid_t pid, intptr_t scan_start, size_t scan_size,
         if (scanned + read_sz > scan_size) read_sz = scan_size - scanned;
 
         intptr_t chunk_addr = scan_start + (intptr_t)scanned;
-        /* Stop at the first unreadable chunk - that's the mapped module's edge. Continuing
-         * toward MASK_SCAN_LIMIT risks unmapped/MMIO memory, which has caused a kernel panic. */
+        /* Stop at the first unreadable chunk: that is the edge of the mapped module, and scanning on toward
+         * MASK_SCAN_LIMIT can hit unmapped/MMIO memory and panic the kernel. */
         if (!ADDR_IN_USER_RANGE(chunk_addr)) break;
         int rrc = mdbg_io_copyout(pid, chunk_addr, buf, read_sz);
         if (rrc < 0) break;
@@ -1113,6 +1177,69 @@ do_rollback(pid_t pid, const cr_patch_backup_t *backups, int n, int *rollback_er
             (*rollback_errors)++;
         }
     }
+}
+
+static int
+patch_line_is_plain(const patch_line_t *ln) {
+    return ln->type != PATCH_LINE_MASK && ln->type != PATCH_LINE_MASK_JUMP32;
+}
+
+/* Block whose range holds the rel32 target of a jmp/call at the start of block b, or -1. */
+static int
+patch_jump_target_block(const patch_line_t **bl, int nb, int b) {
+    const patch_line_t *j = bl[b];
+    if (j->value_len < 5 || (j->value[0] != 0xE9 && j->value[0] != 0xE8)) return -1;
+    int32_t rel;
+    memcpy(&rel, j->value + 1, 4);
+    intptr_t target = j->offset + 5 + rel;
+    for (int k = 0; k < nb; k++) {
+        if (k != b && target >= bl[k]->offset && target < bl[k]->offset + (intptr_t)bl[k]->value_len) return k;
+    }
+    return -1;
+}
+
+static void
+patch_plan_emit(const patch_line_t **bl, int nb, int b, char *done,
+                const patch_line_t **plan, int *pn) {
+    if (done[b]) return;
+    done[b] = 1;
+    int t = patch_jump_target_block(bl, nb, b);
+    if (t >= 0) patch_plan_emit(bl, nb, t, done, plan, pn);
+    plan[(*pn)++] = bl[b];
+}
+
+/* Write order for an entry: contiguous lines merge into one write, and a block that jumps into another
+ * one in the same run goes after its target. Merged blocks live in `store`; returns the write count. */
+static int
+patch_build_plan(const patch_entry_t *entry, patch_line_t *store, const patch_line_t **plan) {
+    int pn = 0, used = 0, n = entry->line_count;
+    for (int i = 0; i < n;) {
+        if (!patch_line_is_plain(&entry->lines[i])) { plan[pn++] = &entry->lines[i++]; continue; }
+
+        const patch_line_t *bl[PATCH_MAX_LINES];
+        char done[PATCH_MAX_LINES] = {0};
+        int nb = 0;
+        patch_line_t *lastmod = NULL;
+        while (i < n && patch_line_is_plain(&entry->lines[i])) {
+            const patch_line_t *ln = &entry->lines[i++];
+            const patch_line_t *last = nb ? bl[nb - 1] : NULL;
+            if (last && ln->offset == last->offset + (intptr_t)last->value_len &&
+                last->value_len + ln->value_len <= PATCH_LINE_MAX_BYTES) {
+                if (!lastmod) {
+                    lastmod = &store[used++];
+                    *lastmod = *last;
+                    bl[nb - 1] = lastmod;
+                }
+                memcpy(lastmod->value + lastmod->value_len, ln->value, ln->value_len);
+                lastmod->value_len += ln->value_len;
+            } else {
+                bl[nb++] = ln;
+                lastmod = NULL;
+            }
+        }
+        for (int b = 0; b < nb; b++) patch_plan_emit(bl, nb, b, done, plan, &pn);
+    }
+    return pn;
 }
 
 int
@@ -1182,26 +1309,41 @@ patch_apply_entry_ex(const char *title_id, const patch_entry_t *entry,
     }
     int backup_count = 0;
 
+    patch_line_t *store = calloc(entry->line_count, sizeof(*store));
+    const patch_line_t **plan = calloc(entry->line_count, sizeof(*plan));
+    if (!store || !plan) {
+        free(store);
+        free(plan);
+        free(backups);
+        g_cheat_applying = 0;
+        pthread_mutex_unlock(&g_cheat_apply_lock);
+        if (result) { snprintf(result->error, 64, "oom");
+                      snprintf(result->message, 256, "out of memory"); }
+        return -1;
+    }
+    int plan_count = patch_build_plan(entry, store, plan);
+    cr_log("info", "patches", "write plan: %d line(s) -> %d write(s) title=%s",
+           entry->line_count, plan_count, title_id);
+
     int rc            = 0;
     int verify_fails  = 0;
+    int skipped_lines = 0;
     char err_msg[256] = {0};
     char err_code[64] = {0};
 
-    for (int i = 0; i < entry->line_count; i++) {
-        const patch_line_t *ln = &entry->lines[i];
+    for (int i = 0; i < plan_count; i++) {
+        const patch_line_t *ln = plan[i];
         intptr_t write_addr = 0;
 
         if (ln->type == PATCH_LINE_MASK_JUMP32) {
-            /* Detour trampoline: hook site (Address+Offset) JMPs into a cave (Target) holding
-             * Value + a JMP back. Three independent writes, each backed up for rollback. */
+            /* Detour trampoline: a JMP redirects the hook site (Address+Offset) into the cave (Target), which holds
+             * Value and a JMP back. Three writes, each with its own backup so rollback restores everything. */
             intptr_t patch_match = scan_for_pattern(pid, base, MASK_SCAN_LIMIT,
                                                     ln->pattern, ln->wildcard, ln->pattern_len);
             if (!patch_match) {
-                snprintf(err_code, sizeof(err_code), "mask_jump32_addr_not_found");
-                snprintf(err_msg,  sizeof(err_msg),
-                         "line[%d] Address pattern not found in game memory", i);
-                cr_log("warn", "patches", "mask_jump32 addr_not_found line=%d title=%s", i, title_id);
-                rc = -1; break;
+                cr_log("warn", "patches", "mask_jump32 addr_not_found line=%d title=%s - line skipped", i, title_id);
+                skipped_lines++;
+                continue;
             }
             intptr_t patch_addr = patch_match + (intptr_t)ln->match_offset;
 
@@ -1209,11 +1351,9 @@ patch_apply_entry_ex(const char *title_id, const patch_entry_t *entry,
                                                   ln->target_pattern, ln->target_wildcard,
                                                   ln->target_pattern_len);
             if (!cave_addr) {
-                snprintf(err_code, sizeof(err_code), "mask_jump32_target_not_found");
-                snprintf(err_msg,  sizeof(err_msg),
-                         "line[%d] Target pattern not found in game memory", i);
-                cr_log("warn", "patches", "mask_jump32 target_not_found line=%d title=%s", i, title_id);
-                rc = -1; break;
+                cr_log("warn", "patches", "mask_jump32 target_not_found line=%d title=%s - line skipped", i, title_id);
+                skipped_lines++;
+                continue;
             }
             intptr_t cave_end = cave_addr + (intptr_t)ln->value_len;
 
@@ -1289,11 +1429,9 @@ patch_apply_entry_ex(const char *title_id, const patch_entry_t *entry,
             intptr_t match = scan_for_pattern(pid, base, MASK_SCAN_LIMIT,
                                               ln->pattern, ln->wildcard, ln->pattern_len);
             if (!match) {
-                snprintf(err_code, sizeof(err_code), "mask_not_found");
-                snprintf(err_msg,  sizeof(err_msg),
-                         "line[%d] pattern not found in game memory", i);
-                cr_log("warn", "patches", "mask_scan not_found line=%d title=%s", i, title_id);
-                rc = -1; break;
+                cr_log("warn", "patches", "mask_scan not_found line=%d title=%s - line skipped", i, title_id);
+                skipped_lines++;
+                continue;
             }
             write_addr = match + (intptr_t)ln->match_offset;
 
@@ -1345,14 +1483,22 @@ patch_apply_entry_ex(const char *title_id, const patch_entry_t *entry,
             backups[backup_count].address = (uint64_t)write_addr;
             backups[backup_count].len     = ln->value_len;
             backups[backup_count].valid   = 1;
+            if (ln->type != PATCH_LINE_MASK) {
+                char old_h[52] = {0}, new_h[52] = {0};
+                size_t hn = ln->value_len < 16 ? ln->value_len : 16;
+                for (size_t b = 0; b < hn; b++) {
+                    snprintf(old_h + b * 3, sizeof(old_h) - b * 3, "%02x ", backups[backup_count].old_bytes[b]);
+                    snprintf(new_h + b * 3, sizeof(new_h) - b * 3, "%02x ", ln->value[b]);
+                }
+                cr_log("info", "patches", "line[%d] original=[%s] new=[%s]", i, old_h, new_h);
+            }
         }
         backup_count++;
 
         /* Write */
         int wrc;
         if (ln->type == PATCH_LINE_MASK) {
-            /* Use write_process_memory_forced — skips kernel_get_vmem_protection,
-             * which hangs indefinitely on PS4 BC vmem entries (e.g. Bloodborne). */
+            /* Skips kernel_get_vmem_protection (forced write), which hangs on PS4 BC vmem entries. */
             wrc = write_process_memory_forced(pid, write_addr, ln->value, ln->value_len);
             if (wrc != 0) {
                 snprintf(err_code, sizeof(err_code), "write_failed");
@@ -1374,8 +1520,7 @@ patch_apply_entry_ex(const char *title_id, const patch_entry_t *entry,
                 }
             }
         } else {
-            /* write_process_memory_forced skips kernel_get_vmem_protection,
-             * required for PS4 BC vmem entries which panic the kernel otherwise. */
+            /* Same here: kernel_get_vmem_protection panics the kernel on PS4 BC vmem entries. */
             wrc = write_process_memory_forced(pid, write_addr, ln->value, ln->value_len);
             if (wrc != 0) {
                 snprintf(err_code, sizeof(err_code), "write_failed");
@@ -1410,6 +1555,12 @@ patch_apply_entry_ex(const char *title_id, const patch_entry_t *entry,
         }
     }
 
+    if (rc == 0 && skipped_lines > 0 && skipped_lines == plan_count) {
+        snprintf(err_code, sizeof(err_code), "mask_not_found");
+        snprintf(err_msg,  sizeof(err_msg), "no line of this patch matched the game's memory");
+        rc = -1;
+    }
+
     int rollback_errors = 0;
     int rolled_back     = 0;
     if (rc != 0) {
@@ -1428,20 +1579,27 @@ patch_apply_entry_ex(const char *title_id, const patch_entry_t *entry,
         result->rolled_back      = rolled_back;
         result->rollback_errors  = rollback_errors;
         result->verify_fail_count = verify_fails;
+        result->skipped_lines    = skipped_lines;
         snprintf(result->error,   sizeof(result->error),   "%s", err_code);
         snprintf(result->message, sizeof(result->message), "%s", err_msg);
     }
 
     if (rc == 0) {
         patch_store_backup(title_id, entry->entry_id, entry->name, pid, backups, backup_count);
-        cr_log("info", "patches", "applied '%s' title=%s pid=%d lines=%d",
-               entry->name, title_id, (int)pid, entry->line_count);
-        notify("CheatRunner: Patch applied: %s", entry->name);
+        cr_log("info", "patches", "applied '%s' title=%s pid=%d lines=%d skipped=%d",
+               entry->name, title_id, (int)pid, entry->line_count, skipped_lines);
+        if (skipped_lines > 0) {
+            notify("CheatRunner: Patch applied: %s (%d line(s) not found)", entry->name, skipped_lines);
+        } else {
+            notify("CheatRunner: Patch applied: %s", entry->name);
+        }
     } else {
         cr_log("warn", "patches", "apply_failed '%s' title=%s error=%s",
                entry->name, title_id, err_code);
         notify("CheatRunner: Patch failed: %s", entry->name);
     }
     free(backups);
+    free(store);
+    free(plan);
     return rc;
 }

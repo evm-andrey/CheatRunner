@@ -27,6 +27,7 @@ conflict_map_build(const char *json_text, cheat_conflict_map_t *out) {
     cJSON *mods = cJSON_GetObjectItem(root, "mods");
     if (!cJSON_IsArray(mods)) { cJSON_Delete(root); return -1; }
 
+    int is_name_mc[CONFLICT_MAX_MODS] = {0}; /* from the full name; mod_names is cut at 63 chars */
     int mod_count = cJSON_GetArraySize(mods);
     if (mod_count > CONFLICT_MAX_MODS) mod_count = CONFLICT_MAX_MODS;
     out->mod_count = mod_count;
@@ -43,6 +44,8 @@ conflict_map_build(const char *json_text, cheat_conflict_map_t *out) {
         cJSON *name_j = cJSON_GetObjectItem(mod, "name");
         if (cJSON_IsString(name_j) && name_j->valuestring)
             snprintf(out->mod_names[mi], 64, "%s", name_j->valuestring);
+        if (cJSON_IsString(name_j) && name_j->valuestring)
+            is_name_mc[mi] = strcasestr(name_j->valuestring, "mastercode") || strcasestr(name_j->valuestring, "master code");
 
         cJSON *mem = cJSON_GetObjectItem(mod, "memory");
         if (!cJSON_IsArray(mem)) mem = cJSON_GetObjectItem(mod, "patches");
@@ -62,8 +65,9 @@ conflict_map_build(const char *json_text, cheat_conflict_map_t *out) {
             uint64_t off_u = 0;
             if (parse_offset_hex_checked(off_j->valuestring, &off_u) != 0) continue;
             size_t on_len = 0;
-            uint8_t tmp[128];
-            if (parse_hex_bytes_checked(on_j->valuestring, tmp, sizeof(tmp), &on_len) != 0 || on_len == 0) continue;
+            size_t need = hex_bytes_need(on_j->valuestring);
+            uint8_t *tmp CR_AUTOFREE = malloc(need);
+            if (!tmp || parse_hex_bytes_checked(on_j->valuestring, tmp, need, &on_len) != 0 || on_len == 0) continue;
             cmap_entry_t *ce = &(*entries_p)[mi][entry_n[mi]++];
             ce->off    = off_u;
             ce->len    = on_len;
@@ -73,19 +77,18 @@ conflict_map_build(const char *json_text, cheat_conflict_map_t *out) {
         }
     }
 
-    /* group_id = nearest preceding mastercode index (-1 none, -2 is one) - name match
-     * alone isn't enough, also require a cave-sized (>=16 byte) entry like mod_has_cave_entry(). */
+    /* group_id: nearest preceding mastercode index (-1 none, -2 is one); the name alone is not enough,
+     * it also needs a cave-sized (>=16 byte) entry, like mod_has_cave_entry(). */
     int mod_group[CONFLICT_MAX_MODS];
     for (int mi = 0; mi < mod_count; mi++) mod_group[mi] = -1;
     {
         int last_mc = -1;
         for (int mi = 0; mi < mod_count; mi++) {
-            const char *nm = out->mod_names[mi];
             int has_cave = 0;
             for (int ei = 0; ei < entry_n[mi]; ei++) {
                 if ((*entries_p)[mi][ei].len >= 16) { has_cave = 1; break; }
             }
-            if ((strcasestr(nm, "mastercode") || strcasestr(nm, "master code")) && has_cave) {
+            if (is_name_mc[mi] && has_cave) {
                 mod_group[mi] = -2; /* IS a mastercode */
                 last_mc = mi;
             } else {
@@ -98,8 +101,7 @@ conflict_map_build(const char *json_text, cheat_conflict_map_t *out) {
     for (int i = 0; i < mod_count; i++) {
         for (int j = i + 1; j < mod_count; j++) {
             if (out->pair_count >= CONFLICT_MAX_PAIRS) goto done;
-            /* Skip: mastercode i vs one of its own dependents — they don't conflict;
-             * enabling a dependent requires the mastercode to be active. */
+            /* A mastercode and its dependents do not conflict; a dependent needs the mastercode active. */
             if (mod_group[i] == -2 && mod_group[j] == i) continue;
             /* Skip: different mastercode groups can be on simultaneously, so they don't conflict. */
             if (mod_group[i] >= 0 && mod_group[j] >= 0 && mod_group[i] != mod_group[j]) continue;

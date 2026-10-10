@@ -31,7 +31,6 @@ void log_push(const char *level, const char *tag, const char *message);
 void cr_log(const char *level, const char *tag, const char *fmt, ...);
 void log_msg(const char *fmt, ...);
 void cr_log_set_level(const char *level);
-const char *cr_log_get_level(void);
 int cr_log_level_enabled(const char *level);
 void cr_log_klog_banner(void);
 

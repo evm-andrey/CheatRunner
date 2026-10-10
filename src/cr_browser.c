@@ -3,8 +3,7 @@
 #include "cr_log.h"
 #include "cr_browser.h"
 
-/* Declared in ps5sdk_compat.h but only needed here — forward-declare locally
-   to avoid pulling in the full compat header from this thin module. */
+/* Declared in ps5sdk_compat.h; forward-declared here to keep this module light. */
 int sceSystemServiceLaunchWebBrowser(const char *uri, void *reserved);
 
 int

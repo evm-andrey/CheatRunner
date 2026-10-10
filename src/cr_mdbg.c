@@ -8,8 +8,7 @@
 #include "cr_mdbg.h"
 #include "pt.h"
 
-/* x86-64 page-table entry flags - machine/pmap.h defines these too, but pulls in
- * struct pmap_statistics with no visible SDK header, so just the 4 constants we need. */
+/* x86-64 page-table flags. machine/pmap.h has them but needs headers the SDK lacks, so only the 4 we use. */
 #define PG_FRAME    (0x000ffffffffff000ul)
 #define X86_PG_V    0x001ul
 #define X86_PG_PS   0x080ul
@@ -33,15 +32,11 @@ mdbg_io_copyout(pid_t pid, intptr_t addr, void *buf, size_t len) {
 }
 
 
-/* mdbg_copyin breaks on FW 8.20+ — walk CR3 to the physical page and write
- * through the kernel direct map instead (ported from ps-patch-system). */
+/* mdbg_copyin breaks on FW 8.20+: walk CR3 to the physical page and write through the kernel direct map. */
 
 static unsigned long
-vmspace_pmap_offset(unsigned int fw) {
-  /* Offset comes from the ps5-payload-sdk (set per firmware in __kernel_init).
-   * The old hard-coded table stopped at 13.40 and blocked every write on 13.60. */
-  (void)fw;
-  return (unsigned long)KERNEL_OFFSET_VMSPACE_VM_PMAP; /* 0 = firmware not supported by the SDK */
+vmspace_pmap_offset(void) {
+  return (unsigned long)KERNEL_OFFSET_VMSPACE_VM_PMAP; /* 0 when the SDK doesn't know this firmware */
 }
 
 static unsigned long g_dmap_base = 0;
@@ -54,11 +49,10 @@ mdbg_get_proc_cr3(pid_t pid) {
   unsigned long vmspace = (unsigned long)kernel_getlong(proc + KERNEL_OFFSET_PROC_P_VMSPACE);
   if (!vmspace) return 0;
 
-  unsigned long off = vmspace_pmap_offset(mdbg_fw_version());
+  unsigned long off = vmspace_pmap_offset();
   if (!off) return 0;
 
-  /* pm_pml4 (KVA) + pm_cr3 (phys) sit next to each other - read both in one shot,
-   * free to grab the extra 8 bytes and populate the dmap base cache for virt2phys below. */
+  /* pm_pml4 (KVA) and pm_cr3 (phys) are adjacent; read both at once, which also seeds the dmap base cache. */
   unsigned long data[2];
   if (kernel_copyout((intptr_t)(vmspace + off + 32), data, sizeof(data))) return 0;
 

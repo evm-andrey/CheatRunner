@@ -14,8 +14,8 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.
 
-Adapted for CheatRunner from PS5-Payload-dev/elfldr (see elfldr.h). Only
-elfldr_prepare_exec's entry-point handoff is CheatRunner's own; rest is upstream. */
+Trimmed to the subset needed to inject an ELF into an already-running
+process; elfldr_prepare_exec's entry-point handoff is CheatRunner-specific. */
 
 #include <elf.h>
 #include <errno.h>
@@ -44,23 +44,16 @@ elfldr_prepare_exec's entry-point handoff is CheatRunner's own; rest is upstream
 #endif
 
 
-/**
- * Convenient macros.
- **/
 #define ROUND_PG(x) (((x) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
 #define TRUNC_PG(x) ((x) & ~(PAGE_SIZE - 1))
 #define PFLAGS(x)   ((((x) & PF_R) ? PROT_READ  : 0) | \
 		     (((x) & PF_W) ? PROT_WRITE : 0) | \
 		     (((x) & PF_X) ? PROT_EXEC  : 0))
 
-/* scratch stack for the pthread_create stub - must not reuse the hijacked
- * thread's own stack (see elfldr_prepare_exec). */
+/* Scratch stack for the pthread_create stub; it must not reuse the hijacked thread stack. */
 #define ELFLDR_STUB_STACK_SIZE (16 * 1024)
 
 
-/**
- * Context structure for the ELF loader.
- **/
 typedef struct elfldr_ctx {
   uint8_t* elf;
   pid_t    pid;
@@ -71,9 +64,6 @@ typedef struct elfldr_ctx {
 } elfldr_ctx_t;
 
 
-/**
-* Parse a R_X86_64_RELATIVE relocatable.
-**/
 static int
 r_relative(elfldr_ctx_t *ctx, Elf64_Rela* rela) {
   intptr_t* loc = ctx->base_mirror + rela->r_offset;
@@ -85,9 +75,6 @@ r_relative(elfldr_ctx_t *ctx, Elf64_Rela* rela) {
 }
 
 
-/**
- * Parse a PT_LOAD program header.
- **/
 static int
 data_load(elfldr_ctx_t *ctx, Elf64_Phdr *phdr) {
   void* data = ctx->base_mirror + phdr->p_vaddr;
@@ -111,9 +98,7 @@ elfldr_sanity_check(uint8_t *elf, size_t elf_size) {
   Elf64_Ehdr *ehdr = (Elf64_Ehdr*)elf;
   Elf64_Phdr *phdr;
 
-  if(elf_size < sizeof(Elf64_Ehdr) ||
-     elf_size < sizeof(Elf64_Phdr) + ehdr->e_phoff ||
-     elf_size < sizeof(Elf64_Shdr) + ehdr->e_shoff) {
+  if(elf_size < sizeof(Elf64_Ehdr)) {
     return -1;
   }
 
@@ -122,9 +107,18 @@ elfldr_sanity_check(uint8_t *elf, size_t elf_size) {
     return -1;
   }
 
+  // written as subtractions so nothing can wrap around
+  if(ehdr->e_phoff > elf_size ||
+     (size_t)ehdr->e_phnum > (elf_size - ehdr->e_phoff) / sizeof(Elf64_Phdr) ||
+     ehdr->e_shoff > elf_size ||
+     (size_t)ehdr->e_shnum > (elf_size - ehdr->e_shoff) / sizeof(Elf64_Shdr)) {
+    return -1;
+  }
+
   phdr = (Elf64_Phdr*)(elf + ehdr->e_phoff);
   for(int i=0; i<ehdr->e_phnum; i++) {
-    if(phdr[i].p_offset + phdr[i].p_filesz > elf_size) {
+    if(phdr[i].p_offset > elf_size ||
+       phdr[i].p_filesz > elf_size - phdr[i].p_offset) {
       return -1;
     }
   }
@@ -133,9 +127,6 @@ elfldr_sanity_check(uint8_t *elf, size_t elf_size) {
 }
 
 
-/**
- * Load an ELF into the address space of a process with the given pid.
- **/
 static intptr_t
 elfldr_load(pid_t pid, uint8_t *elf) {
   Elf64_Ehdr *ehdr = (Elf64_Ehdr*)elf;
@@ -151,6 +142,10 @@ elfldr_load(pid_t pid, uint8_t *elf) {
 
   // Compute size of virtual memory region.
   for(int i=0; i<ehdr->e_phnum; i++) {
+    if(phdr[i].p_type != PT_LOAD) {
+      continue;
+    }
+
     if(phdr[i].p_vaddr < min_vaddr) {
       min_vaddr = phdr[i].p_vaddr;
     }
@@ -258,9 +253,6 @@ elfldr_load(pid_t pid, uint8_t *elf) {
 }
 
 
-/**
- * Create payload args in the address space of the process with the given pid.
- **/
 static intptr_t
 elfldr_payload_args(pid_t pid) {
   int victim_sock;
@@ -270,7 +262,7 @@ elfldr_payload_args(pid_t pid) {
   int pipe1;
 
   if((buf=pt_mmap(pid, 0, PAGE_SIZE, PROT_READ | PROT_WRITE,
-		  MAP_ANONYMOUS | MAP_PRIVATE, -1, 0)) == -1) {
+		  MAP_ANONYMOUS | MAP_PRIVATE, -1, 0)) <= 0) {
     LOG_PT_PERROR(pid, "pt_mmap");
     return 0;
   }
@@ -341,10 +333,8 @@ elfldr_payload_args(pid_t pid) {
 }
 
 
-/**
- * Resolve pthread_create in the target; same dual-handle fallback pt_resolve
- * uses for NIDs, since dlsym takes a plain name instead.
- **/
+/* Resolves pthread_create in the target with the same dual-handle fallback pt_resolve uses for NIDs
+ * (dlsym takes a plain name). */
 static intptr_t
 elfldr_resolve_pthread_create(pid_t pid) {
   intptr_t addr;
@@ -356,10 +346,8 @@ elfldr_resolve_pthread_create(pid_t pid) {
 }
 
 
-/**
- * Shellcode for: pthread_create(thread_out, NULL, entry, args); int3;
- * All operands are hardcoded immediates, so it needs no relocation.
- **/
+/* Shellcode for pthread_create(thread_out, NULL, entry, args); int3. The operands are immediates,
+ * so it needs no relocation. */
 static int
 elfldr_build_pthread_stub(uint8_t *out, size_t out_len, intptr_t pthread_create_addr,
                            intptr_t thread_out, intptr_t entry, intptr_t args) {
@@ -398,8 +386,8 @@ typedef struct {
   volatile int *done;
 } elfldr_watchdog_arg_t;
 
-/* Safety net for the pt_* and kernel_mprotect calls below - none have their own
- * timeout, and the target stays ptrace-stopped forever if one blocks. */
+/* Safety net: none of the pt_* and kernel_mprotect calls below have a timeout, and the target stays
+ * ptrace-stopped if one blocks. */
 static void *
 elfldr_hang_watchdog(void *arg) {
   elfldr_watchdog_arg_t *wa = (elfldr_watchdog_arg_t *)arg;
@@ -416,18 +404,16 @@ elfldr_hang_watchdog(void *arg) {
 
   if (!*wa->done) {
     cr_log("error", "elfldr",
-           "pid=%d: injection sequence didn't finish within %dms - killing it "
-           "so it doesn't stay stopped forever", (int)wa->pid, ELFLDR_HANG_WATCHDOG_MS);
-    kill(wa->pid, SIGKILL);
+           "pid=%d: injection sequence didn't finish within %dms - letting it go "
+           "so it doesn't stay stopped", (int)wa->pid, ELFLDR_HANG_WATCHDOG_MS);
+    pt_detach(wa->pid, 0);
   }
   return NULL;
 }
 
 
-/**
- * Runs a hand-built stub via PT_CONTINUE + int3 (not pt_call's single-step,
- * which froze SceShellUI 15+s in pthread_create) and restores full GP+FP state after.
- **/
+/* Runs a hand-built stub with PT_CONTINUE + int3 (pt_call's single-step froze SceShellUI for 15+ s)
+ * and restores the full GP+FP state afterwards. */
 static int
 elfldr_prepare_exec(pid_t pid, uint8_t *elf) {
   intptr_t entry;
@@ -452,23 +438,27 @@ elfldr_prepare_exec(pid_t pid, uint8_t *elf) {
   pthread_t watchdog_thr;
   int have_watchdog = 0;
 
+  LOG_DEBUG("pid=%d: loading the payload ELF", (int)pid);
   if(!(entry=elfldr_load(pid, elf))) {
     LOG_PUTS("elfldr_load failed");
     return -1;
   }
+  LOG_DEBUG("pid=%d: ELF mapped, entry=0x%llx", (int)pid, (unsigned long long)entry);
 
   if(!(args=elfldr_payload_args(pid))) {
     LOG_PUTS("elfldr_payload_args failed");
     return -1;
   }
 
+  LOG_DEBUG("pid=%d: payload args at 0x%llx", (int)pid, (unsigned long long)args);
   if(!(pthread_create_addr=elfldr_resolve_pthread_create(pid))) {
     LOG_PUTS("couldn't resolve pthread_create");
     return -1;
   }
+  LOG_DEBUG("pid=%d: pthread_create at 0x%llx", (int)pid, (unsigned long long)pthread_create_addr);
 
-  /* pthread_t out-param and stub code share the args page's free tail —
-   * elfldr_payload_args only uses up to args+0x300 of its page-sized buffer. */
+  /* The pthread_t out-param and the stub share the free tail of the args page
+   * (elfldr_payload_args uses only up to args+0x300). */
   thread_out = args + 0x310;
   stub_addr  = args + 0x320;
 
@@ -478,15 +468,14 @@ elfldr_prepare_exec(pid_t pid, uint8_t *elf) {
     return -1;
   }
 
-  /* No per-call timeout below, so the watchdog above guards the whole section.
-   * Every exit goes through `out` so it always gets stopped and cleaned up. */
+  /* The watchdog above guards this whole section (no per-call timeouts); every exit goes through `out`
+   * so the watchdog is always stopped and cleaned up. */
   have_watchdog = (pthread_create(&watchdog_thr, NULL, elfldr_hang_watchdog, &wd_arg) == 0);
   if (!have_watchdog) {
     LOG_PUTS("couldn't start hang watchdog - proceeding without it");
   }
 
-  /* Dedicated stack for the stub - reusing the hijacked thread's live stack
-   * risks stomping ABI red-zone data it's still using when it resumes. */
+  /* Dedicated stack for the stub; the hijacked thread live stack may hold red-zone data it needs on resume. */
   if((stub_stack=pt_mmap(pid, 0, ELFLDR_STUB_STACK_SIZE, PROT_READ | PROT_WRITE,
                           MAP_ANONYMOUS | MAP_PRIVATE, -1, 0)) == -1) {
     LOG_PT_PERROR(pid, "pt_mmap");
@@ -494,8 +483,10 @@ elfldr_prepare_exec(pid_t pid, uint8_t *elf) {
     goto out;
   }
 
-  /* Fault the page in through the kernel-mediated write path (like every
-   * other mmap here) instead of leaving it lazy-backed for raw execution to hit first. */
+  LOG_DEBUG("pid=%d: stub stack at 0x%llx", (int)pid, (unsigned long long)stub_stack);
+
+  /* Fault the page in through the kernel-mediated write path, like the other mmaps here, instead of
+   * leaving it lazy-backed. */
   if(pt_setint(pid, stub_stack, 0)) {
     LOG_PT_PERROR(pid, "pt_setint");
     error = -1;
@@ -514,14 +505,15 @@ elfldr_prepare_exec(pid_t pid, uint8_t *elf) {
     goto out;
   }
 
-  /* Pin every register op below to this LWP - plain pid can drift to a
-   * different thread on a busy target. Raw id, no negation (that's EINVAL here). */
+  /* Pin every register op to this LWP (a plain pid can drift to another thread). Raw id, no negation:
+   * that is EINVAL here. */
   if((lwp=pt_get_lwpid(pid)) == -1) {
     LOG_PT_PERROR(pid, "pt_get_lwpid");
     error = -1;
     goto out;
   }
   target = lwp;
+  LOG_DEBUG("pid=%d: hijacking lwp %d", (int)pid, (int)lwp);
 
   if(pt_getregs(target, &bak_reg)) {
     LOG_PERROR("pt_getregs");
@@ -534,6 +526,8 @@ elfldr_prepare_exec(pid_t pid, uint8_t *elf) {
     goto out;
   }
   have_bak_regs = 1;
+  LOG_DEBUG("pid=%d: saved registers, rip=0x%llx rsp=0x%llx", (int)pid,
+            (unsigned long long)bak_reg.r_rip, (unsigned long long)bak_reg.r_rsp);
 
   run_reg = bak_reg;
   run_reg.r_rip = stub_addr;
@@ -546,12 +540,13 @@ elfldr_prepare_exec(pid_t pid, uint8_t *elf) {
     goto out;
   }
 
+  LOG_DEBUG("pid=%d: running the stub at 0x%llx", (int)pid, (unsigned long long)stub_addr);
   if(pt_continue(target, 0)) {
     LOG_PERROR("pt_continue");
     error = -1;
   } else {
-    /* Bounded wait - a blocking waitpid here previously hung this thread (and
-     * SceShellUI's IPC) forever if the stub never reached its breakpoint. */
+    /* Bounded wait: a blocking waitpid here can hang this thread (and the SceShellUI IPC) forever if the
+     * stub never reaches its breakpoint. */
     int waited_ms = 0;
     const int step_ms = 10;
     const int timeout_ms = 3000;
@@ -566,10 +561,18 @@ elfldr_prepare_exec(pid_t pid, uint8_t *elf) {
       waited_ms += step_ms;
     }
 
+    LOG_DEBUG("pid=%d: stub wait ended after %d ms, waitpid=%d", (int)pid, waited_ms, (int)wret);
     if(wret == 0) {
-      LOG_PUTS("stub timed out — killing the target to avoid hanging its watchers");
-      kill(pid, SIGKILL);
-      waitpid(pid, &status, 0);
+      /* Stop the thread so its registers can be put back below. */
+      LOG_PUTS("stub timed out - stopping the thread to restore it");
+      kill(pid, SIGSTOP);
+      for(waited_ms = 0; waited_ms < 1000 && !(wret = waitpid(pid, &status, WNOHANG)); waited_ms += step_ms) {
+        usleep((useconds_t)step_ms * 1000);
+      }
+      if(wret != pid || !WIFSTOPPED(status)) {
+        LOG_PUTS("couldn't stop the thread - leaving it to the detach");
+        have_bak_regs = 0;
+      }
       error = -1;
     } else if(wret == -1) {
       LOG_PERROR("waitpid");
@@ -581,91 +584,32 @@ elfldr_prepare_exec(pid_t pid, uint8_t *elf) {
   }
 
 out:
-  /* Stop the watchdog before anything else - it may already be mid-kill from
-   * just before this line, so join it and let that settle first. */
+  /* Stop the watchdog first (it may already be mid-kill): join it and let that settle. */
   watchdog_done = 1;
   if (have_watchdog) {
     pthread_join(watchdog_thr, NULL);
   }
 
-  /* Deliberately NOT unmapped - pthread_create returning only means the new
-   * thread exists, not that it's finished bootstrapping; freeing this immediately was the real (use-after-free) crash. */
+  /* Deliberately not unmapped: pthread_create returning only means the thread exists, not that it finished
+   * starting; freeing this early is a use-after-free crash. */
 
-  /* Restore only if we actually captured registers - an early failure before
-   * pt_getregs/pt_getfpregs means nothing was touched, so there's nothing to restore. */
+  /* Restore only if the registers were captured; an earlier failure touched nothing. */
   if (have_bak_regs) {
-    pt_setregs(target, &bak_reg);
-    pt_setfpregs(target, bak_fpregs);
+    int r1 = pt_setregs(target, &bak_reg);
+    int r2 = pt_setfpregs(target, bak_fpregs);
+    LOG_DEBUG("pid=%d: registers restored (gp=%d fp=%d), error=%d", (int)pid, r1, r2, error);
   }
 
   return error;
 }
 
 
-/**
- * Escape jail and raise privileges.
- **/
-int
-elfldr_raise_privileges(pid_t pid) {
-  static const uint8_t caps[16] = {0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-				   0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff};
-  intptr_t vnode;
 
-  if(!(vnode=kernel_get_root_vnode())) {
-    return -1;
-  }
-  if(kernel_set_proc_rootdir(pid, vnode)) {
-    return -1;
-  }
-  if(kernel_set_proc_jaildir(pid, 0)) {
-    return -1;
-  }
-  if(kernel_set_ucred_uid(pid, 0)) {
-    return -1;
-  }
-  if(kernel_set_ucred_caps(pid, caps)) {
-    return -1;
-  }
-
-  return 0;
-}
-
-
-/**
- * Execute an ELF inside the process with the given pid.
- **/
 int
 elfldr_exec(pid_t pid, int stdio, uint8_t* elf) {
-  uint8_t caps[16];
-  intptr_t jaildir;
-  intptr_t rootdir;
-  uint64_t authid;
   int error = 0;
 
-  // backup privileges
-  jaildir = kernel_get_proc_jaildir(pid);
-  if(!(rootdir=kernel_get_proc_rootdir(pid))) {
-    LOG_PUTS("kernel_get_proc_rootdir failed");
-    pt_detach(pid, 0);
-    return -1;
-  }
-  if(kernel_get_ucred_caps(pid, caps)) {
-    LOG_PUTS("kernel_get_ucred_caps failed");
-    pt_detach(pid, 0);
-    return -1;
-  }
-  if(!(authid=kernel_get_ucred_authid(pid))) {
-    LOG_PUTS("kernel_get_ucred_authid failed");
-    pt_detach(pid, 0);
-    return -1;
-  }
-
-  if(elfldr_raise_privileges(pid)) {
-    LOG_PUTS("Unable to raise privileges");
-    pt_detach(pid, 0);
-    return -1;
-  }
-
+  // the target keeps its own credentials; the payload raises what it needs itself
   if(stdio > 0) {
     stdio = pt_rdup(pid, getpid(), stdio);
 
@@ -684,29 +628,11 @@ elfldr_exec(pid_t pid, int stdio, uint8_t* elf) {
     error = -1;
   }
 
-  // restore privileges
-  if(kernel_set_proc_jaildir(pid, jaildir)) {
-    LOG_PUTS("kernel_set_proc_jaildir failed");
-    error = -1;
-  }
-  if(kernel_set_proc_rootdir(pid, rootdir)) {
-    LOG_PUTS("kernel_set_proc_rootdir failed");
-    error = -1;
-  }
-
-  if(kernel_set_ucred_caps(pid, caps)) {
-    LOG_PUTS("kernel_set_ucred_caps failed");
-    error = -1;
-  }
-  if(kernel_set_ucred_authid(pid, authid)) {
-    LOG_PUTS("kernel_set_ucred_authid failed");
-    error = -1;
-  }
-
   if(pt_detach(pid, 0)) {
     LOG_PERROR("pt_detach");
     error = -1;
   }
+  LOG_DEBUG("pid=%d: detached, result=%d", (int)pid, error);
 
   return error;
 }

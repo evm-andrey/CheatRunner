@@ -4,33 +4,33 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-
 #include "jb.h"
 #include "priv_bootstrap.h"
 #include "ps5sdk_compat.h"
 #include "cr_activity.h"
 #include "cr_config.h"
 #include "cr_game_monitor.h"
+#include "cr_hotkey_hook.h"
 #include "cr_http.h"
 #include "cr_launch.h"
 #include "cr_log.h"
 #include "cr_notifications.h"
-#include "cr_hotkey_hook.h"
 #include "cr_paths.h"
 #include "cr_shutdown.h"
 #include "cr_cheats.h"
 #include "cr_cheat_profiles.h"
 #include "cr_patch_profiles.h"
-#include "cr_addr_cache.h"
-#include "cr_title_prefs.h"
 #include "cr_favorites.h"
-#include "cr_fan.h"
 #include "cr_tile_pkg.h"
-
+#include "build_id.h"
 #ifndef CHEATRUNNER_VERSION
-#define CHEATRUNNER_VERSION "0.17.1"
+#define CHEATRUNNER_VERSION "0.18"
 #endif
 
 /* Async-signal-safe crash handler: writes a one-line entry to the crash log
@@ -52,6 +52,59 @@ crash_sighandler(int sig) {
     close(fd);
   }
   _exit(sig);
+}
+
+/* Older builds let the tile-installer thread rename the whole process, so look for both names. */
+static pid_t
+find_old_instance(void) {
+  static const char *const names[] = { "CheatRunner.elf", "cr-tile-inst" };
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+    pid_t pid = find_pid_by_name(names[i]);
+    if (pid > 0) return pid;
+  }
+  return -1;
+}
+
+/* True if something accepts connections on the loopback port. */
+static int
+port_answers(int port) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return 0;
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET;
+  a.sin_port = htons((uint16_t)port);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  int up = connect(fd, (struct sockaddr *)&a, sizeof(a)) == 0;
+  close(fd);
+  return up;
+}
+
+/* An older CheatRunner can outlive the kill-by-name pass and keep serving its old dashboard; ask each one to exit. */
+static void
+evict_old_instance(int port) {
+  for (int round = 0; round < 2 && port_answers(port); round++) {
+    cr_log("warn", "boot", "an older instance answers on port %d, asking it to exit", port);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) == 0) {
+      static const char req[] = "POST /api/dev/shutdown HTTP/1.0\r\nContent-Length: 0\r\n\r\n";
+      char junk[256];
+      (void)send(fd, req, sizeof(req) - 1, 0);
+      (void)recv(fd, junk, sizeof(junk), 0);
+    }
+    close(fd);
+    /* The old instance exits after its shutdown delay; give it time to drop the port. */
+    for (int i = 0; i < 5; i++) usleep(300 * 1000);
+  }
+  if (port_answers(port)) {
+    cr_log("error", "boot", "older instance is still answering; the dashboard may show the old version");
+  }
 }
 
 int
@@ -76,39 +129,7 @@ main(void) {
   puts(" | |   | '_ \\ / _ \\/ _` | __| |_) | | | | '_ \\| '_ \\ / _ \\ '__|");
   puts(" | |___| | | |  __/ (_| | |_|  _ <| |_| | | | | | | |  __/ |   ");
   puts("  \\____|_| |_|\\___|\\__,_|\\__|_| \\_\\\\__,_|_| |_|_| |_|\\___|_|   ");
-  log_msg("version: %s", CHEATRUNNER_VERSION);
-
-/* Kill any old instance before our own jb_escalate_pid runs — it may hold the
- * same singleton exploit resource. Capped at 60 spins so a zombie can't loop forever. */
-  {
-    int kill_spins = 0;
-    int found_old = 0;
-    cr_log("info", "boot", "checking for a previous instance (mypid=%d)", (int)getpid());
-    while ((old_pid = find_pid_by_name("CheatRunner.elf")) > 0 && kill_spins < 60) {
-      found_old = 1;
-      cr_log("info", "boot", "found previous instance pid=%d", (int)old_pid);
-      int kerr = kill(old_pid, SIGKILL);
-      if (kerr != 0) {
-        int e = errno;
-        cr_log("warn", "boot", "SIGKILL pid=%d errno=%d", old_pid, e);
-        if (e == EPERM) {
-          cr_log("error", "boot", "cannot kill old instance (EPERM)");
-          break;
-        }
-        if (e == ESRCH) {
-          cr_log("info", "boot", "old instance pid=%d already gone", old_pid);
-          break;
-        }
-      }
-      usleep(150 * 1000);
-      kill_spins++;
-    }
-    if (found_old && old_pid <= 0) {
-      cr_log("info", "boot", "old instance killed");
-    } else if (old_pid > 0 && kill_spins >= 60) {
-      cr_log("warn", "boot", "old instance pid=%d still visible after 9s (zombie?)", old_pid);
-    }
-  }
+  log_msg("version: %s (build %s)", CHEATRUNNER_VERSION, CHEATRUNNER_BUILD_ID);
 
 #ifdef __SCE__
   if (jb_escalate_pid(getpid()) != 0) {
@@ -130,8 +151,34 @@ main(void) {
   }
 #endif
 
+  /* Kill any previous instance before binding. EPERM (the old one escalated, we did not) breaks fast,
+   * ESRCH means gone, and 60 spins is the cap so a zombie cannot loop forever. */
   {
-    int urc = sceUserServiceInitialize(NULL);
+    int kill_spins = 0;
+    while ((old_pid = find_old_instance()) > 0 && kill_spins < 60) {
+      if (kill_spins == 0) cr_log("info", "boot", "killing previous instance pid=%d", old_pid);
+      int kerr = kill(old_pid, SIGKILL);
+      if (kerr != 0) {
+        int e = errno;
+        cr_log("warn", "boot", "SIGKILL pid=%d errno=%d", old_pid, e);
+        if (e == EPERM) {
+          cr_log("error", "boot",
+                 "cannot kill old instance (EPERM) — escalation may have failed");
+          break;
+        }
+        if (e == ESRCH) break;  /* already dead */
+      }
+      usleep(150 * 1000);
+      kill_spins++;
+    }
+    if (old_pid > 0 && kill_spins >= 60) {
+      cr_log("warn", "boot", "old instance pid=%d still visible after 9s (zombie?)", old_pid);
+    }
+  }
+
+  {
+    int prio = 256;
+    int urc = sceUserServiceInitialize(&prio);
     if (urc != 0 && urc != (int)0x80960003) {
       cr_log("warn", "core", "sceUserServiceInitialize rc=0x%08X", (uint32_t)urc);
     }
@@ -139,27 +186,27 @@ main(void) {
 
   ensure_data_dirs();
   config_load();
+  pthread_mutex_lock(&g_cfg_lock);
+  int boot_port = g_cfg.http_port;
+  pthread_mutex_unlock(&g_cfg_lock);
+  evict_old_instance(boot_port);
   notifications_load();
   activity_load();
   crash_suspects_load();
-  addr_cache_load();
-  title_prefs_load();
   favorites_load();
   cheat_profiles_load();
   patch_profiles_load();
-  fan_init();
   cr_tile_autoinstall_init();
   rpc_refresh_title_and_notify();
   set_launch_status_ex(0, "idle", "", "ready", 1, "", 0, 0);
   notify("CheatRunner v" CHEATRUNNER_VERSION " by maj0r");
   notification_add("boot", "CheatRunner v" CHEATRUNNER_VERSION " started");
   cr_log("info", "boot", "version %s", CHEATRUNNER_VERSION);
-  cr_log("info", "boot", "FW: %s", cr_fw_version_string());
 
   pthread_t http_thread;
   pthread_t monitor_thread;
   pthread_t net_watchdog_thread;
-  pthread_t hotkey_hook_thr;
+  pthread_t hotkey_thr;
   if (pthread_create(&http_thread, NULL, http_server_thread, NULL) != 0) {
     log_msg("error: could not start HTTP thread");
     notify("CheatRunner HTTP thread failed");
@@ -175,16 +222,17 @@ main(void) {
     notify("CheatRunner game monitor thread failed");
     return 1;
   }
-  if (pthread_create(&hotkey_hook_thr, NULL, hotkey_hook_thread, NULL) != 0) {
-    log_msg("error: could not start hotkey hook thread");
-    notify("CheatRunner hotkey hook thread failed");
+  if (pthread_create(&hotkey_thr, NULL, hotkey_hook_thread, NULL) != 0) {
+    log_msg("error: could not start hotkey thread");
+    notify("CheatRunner hotkey thread failed");
     return 1;
   }
+
   pthread_join(http_thread, NULL);
   g_game_monitor_running = 0;
   g_hotkey_hook_running = 0;
   pthread_join(monitor_thread, NULL);
   pthread_join(net_watchdog_thread, NULL);
-  pthread_join(hotkey_hook_thr, NULL);
+  pthread_join(hotkey_thr, NULL);
   return 0;
 }

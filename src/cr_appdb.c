@@ -12,8 +12,7 @@
 #include "cr_log.h"
 #include "cr_paths.h"
 #include "cr_titles.h"
-#include "third_party/stb_image.h"
-#include "third_party/stb_image_write.h"
+#include "ps5sdk_compat.h"
 
 #if CHEATRUNNER_HAVE_SQLITE_APPDB
 #include "third_party/sqlite3.h"
@@ -169,6 +168,120 @@ appdb_table_has_column(sqlite3 *db, const char *table, const char *column) {
   }
   sqlite3_finalize(st);
   return found;
+}
+
+static int
+cmp_str(const void *a, const void *b) {
+  return strcmp((const char *)a, (const char *)b);
+}
+
+/* Index of the logged-in user's table, or -1 when it cannot be told apart. */
+static int
+appdb_user_table_index(char tables[][96], int n) {
+  if (n == 1) {
+    return 0;
+  }
+  uint32_t uid = 0xFFFFFFFFu;
+  if (sceUserServiceGetForegroundUser(&uid) != 0 || uid == 0xFFFFFFFFu) {
+    uid = 0xFFFFFFFFu;
+#if CHEATRUNNER_HAVE_SCE_USER_LIST
+    uint32_t list[16] = {0};
+    size_t actual = 0;
+    if (sceUserServiceGetLoginUserIdList(list, 16, &actual) == 0 && actual == 1) {
+      uid = list[0];
+    }
+#endif
+  }
+  if (uid == 0xFFFFFFFFu || uid == 0) {
+    cr_log("warn", "appdb", "play history: no logged-in user");
+    return -1;
+  }
+  char want[2][48];
+  snprintf(want[0], sizeof(want[0]), "tbl_iconinfo_%x", uid);
+  snprintf(want[1], sizeof(want[1]), "tbl_iconinfo_%08x", uid);
+  for (int t = 0; t < n; t++) {
+    if (!strcasecmp(tables[t], want[0]) || !strcasecmp(tables[t], want[1])) {
+      return t;
+    }
+  }
+  /* Names did not match: tables and /user/home folders are in the same user order. */
+  char users[16][64];
+  int un = 0;
+  DIR *d = opendir("/user/home");
+  struct dirent *e;
+  while (d && (e = readdir(d)) != NULL && un < 16) {
+    if (e->d_name[0] != '.') {
+      snprintf(users[un++], sizeof(users[0]), "%s", e->d_name);
+    }
+  }
+  if (d) {
+    closedir(d);
+  }
+  qsort(users, (size_t)un, sizeof(users[0]), cmp_str);
+  for (int u = 0; u < un; u++) {
+    if (u < n && (!strcasecmp(users[u] , want[0] + 13) || !strcasecmp(users[u], want[1] + 13))) {
+      return u;
+    }
+  }
+  cr_log("warn", "appdb", "play history: user 0x%08x not matched to %d tables", uid, n);
+  return -1;
+}
+
+/* Play time and last played of the logged-in user (tbl_iconinfo_<user>), the numbers the PS5 home screen shows.
+ * Returns 1 when merged, 0 when there are no such tables, -1 when the user's table is unknown. */
+static int
+appdb_merge_activity(sqlite3 *db, game_entry_t *entries, size_t count) {
+  char tables[16][96];
+  int n = 0, merged = 0;
+  sqlite3_stmt *ts = NULL;
+  if (sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tbl_iconinfo_%' ORDER BY name", -1, &ts, NULL) != SQLITE_OK) {
+    return 0;
+  }
+  while (n < 16 && sqlite3_step(ts) == SQLITE_ROW) {
+    const unsigned char *name = sqlite3_column_text(ts, 0);
+    if (name) {
+      snprintf(tables[n++], sizeof(tables[0]), "%s", (const char *)name);
+    }
+  }
+  sqlite3_finalize(ts);
+  if (n == 0) {
+    return 0;
+  }
+  int pick = appdb_user_table_index(tables, n);
+  if (pick < 0) {
+    return -1;
+  }
+  static char logged[96];
+  if (strcmp(logged, tables[pick]) != 0) {
+    snprintf(logged, sizeof(logged), "%s", tables[pick]);
+    cr_log("info", "appdb", "play history from %s (%d table(s))", tables[pick], n);
+  }
+
+  if (appdb_table_has_column(db, tables[pick], "playedTimeOnConsole")) {
+    char sql[256];
+    snprintf(sql, sizeof(sql), "SELECT titleId, COALESCE(playedTimeOnConsole,0), CAST(strftime('%%s', lastAccessTime) AS INTEGER) FROM %s", tables[pick]);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+      while (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *id = sqlite3_column_text(st, 0);
+        char norm[10];
+        if (!id || !title_id_normalize((const char *)id, norm)) {
+          continue;
+        }
+        int k = find_game_index(entries, count, norm);
+        if (k < 0) {
+          continue;
+        }
+        sqlite3_int64 played = sqlite3_column_int64(st, 1);
+        sqlite3_int64 last = sqlite3_column_int64(st, 2);
+        entries[k].play_time_seconds = played > 0 ? (uint64_t)played : 0;
+        entries[k].last_access_time = last > 0 ? (uint64_t)last : 0;
+        merged = 1;
+      }
+      sqlite3_finalize(st);
+    }
+  }
+  return merged ? 1 : -1;
 }
 
 static int
@@ -389,51 +502,56 @@ appdb_collect_games_sqlite(game_entry_t *entries, size_t *count) {
 
   rc = 0;
 
-  /* Read native PS5 playtime from tbl_appbrowse.playTime (seconds, if column exists) */
-  if (has_play_time && *count > 0) {
-    sqlite3_stmt *pt_st = NULL;
-    if (sqlite3_prepare_v2(db,
-          "SELECT titleId, COALESCE(playTime,0) FROM tbl_appbrowse WHERE playTime > 0",
-          -1, &pt_st, NULL) == SQLITE_OK) {
-      while (sqlite3_step(pt_st) == SQLITE_ROW) {
-        const unsigned char *pt_id = sqlite3_column_text(pt_st, 0);
-        sqlite3_int64 pt_val = sqlite3_column_int64(pt_st, 1);
-        if (!pt_id || !pt_id[0] || pt_val <= 0) continue;
-        char pt_norm[10];
-        if (!title_id_normalize((const char *)pt_id, pt_norm)) continue;
-        for (size_t k = 0; k < *count; k++) {
-          if (strcmp(entries[k].title_id, pt_norm) == 0) {
-            entries[k].play_time_seconds = (uint64_t)pt_val;
-            break;
+  /* The home-screen numbers come from the per-profile tables; the old columns are only a fallback. */
+  if (*count > 0 && appdb_merge_activity(db, entries, *count) == 0) {
+    /* Read native PS5 playtime from tbl_appbrowse.playTime (seconds, if column exists) */
+    if (has_play_time && *count > 0) {
+      sqlite3_stmt *pt_st = NULL;
+      if (sqlite3_prepare_v2(db,
+            "SELECT titleId, COALESCE(playTime,0) FROM tbl_appbrowse WHERE playTime > 0",
+            -1, &pt_st, NULL) == SQLITE_OK) {
+        while (sqlite3_step(pt_st) == SQLITE_ROW) {
+          const unsigned char *pt_id = sqlite3_column_text(pt_st, 0);
+          sqlite3_int64 pt_val = sqlite3_column_int64(pt_st, 1);
+          if (!pt_id || !pt_id[0] || pt_val <= 0) continue;
+          char pt_norm[10];
+          if (!title_id_normalize((const char *)pt_id, pt_norm)) continue;
+          for (size_t k = 0; k < *count; k++) {
+            if (strcmp(entries[k].title_id, pt_norm) == 0) {
+              entries[k].play_time_seconds = (uint64_t)pt_val;
+              break;
+            }
           }
         }
+        sqlite3_finalize(pt_st);
       }
-      sqlite3_finalize(pt_st);
     }
-  }
 
-  /* Read last access time from tbl_contentinfo.lastAccessTime */
-  if (has_contentinfo && *count > 0) {
-    sqlite3_stmt *la_st = NULL;
-    if (sqlite3_prepare_v2(db,
-          "SELECT titleId, CAST(strftime('%s', lastAccessTime) AS INTEGER) "
-          "FROM tbl_contentinfo WHERE lastAccessTime IS NOT NULL AND lastAccessTime != ''",
-          -1, &la_st, NULL) == SQLITE_OK) {
-      while (sqlite3_step(la_st) == SQLITE_ROW) {
-        const unsigned char *la_id = sqlite3_column_text(la_st, 0);
-        sqlite3_int64 la_ts = sqlite3_column_int64(la_st, 1);
-        if (!la_id || !la_id[0] || la_ts <= 0) continue;
-        char la_norm[10];
-        if (!title_id_normalize((const char *)la_id, la_norm)) continue;
-        for (size_t k = 0; k < *count; k++) {
-          if (strcmp(entries[k].title_id, la_norm) == 0) {
-            entries[k].last_access_time = (uint64_t)la_ts;
-            break;
+    /* Read last access time from tbl_contentinfo.lastAccessTime */
+    if (has_contentinfo && *count > 0) {
+      sqlite3_stmt *la_st = NULL;
+      if (sqlite3_prepare_v2(db,
+            "SELECT titleId, CAST(strftime('%s', lastAccessTime) AS INTEGER) "
+            "FROM tbl_contentinfo WHERE lastAccessTime IS NOT NULL AND lastAccessTime != ''",
+            -1, &la_st, NULL) == SQLITE_OK) {
+        while (sqlite3_step(la_st) == SQLITE_ROW) {
+          const unsigned char *la_id = sqlite3_column_text(la_st, 0);
+          sqlite3_int64 la_ts = sqlite3_column_int64(la_st, 1);
+          if (!la_id || !la_id[0] || la_ts <= 0) continue;
+          char la_norm[10];
+          if (!title_id_normalize((const char *)la_id, la_norm)) continue;
+          for (size_t k = 0; k < *count; k++) {
+            if (strcmp(entries[k].title_id, la_norm) == 0) {
+              entries[k].last_access_time = (uint64_t)la_ts;
+              break;
+            }
           }
         }
+        sqlite3_finalize(la_st);
       }
-      sqlite3_finalize(la_st);
     }
+
+
   }
 
 done:
@@ -641,62 +759,6 @@ cache_media_path(const char *title_id, int is_pic0, char *out, size_t out_size) 
   return 0;
 }
 
-/* icon0.png ships at 512x512 but only displays at ~200-300px - downscale once
- * here at cache time. Bilinear resize, duplicated from cr_profile.c's resize_rgba. */
-#define CR_ICON_MAX_DIM 256
-
-static uint8_t *
-icon_resize_rgba(const uint8_t *src, int sw, int sh, int dw, int dh) {
-  uint8_t *dst = malloc((size_t)dw * dh * 4);
-  if (!dst) return NULL;
-  for (int y = 0; y < dh; y++) {
-    double ys = (double)y * sh / dh;
-    int y0 = (int)ys, y1 = y0 + 1; if (y1 >= sh) y1 = sh - 1;
-    double yF = ys - y0;
-    for (int x = 0; x < dw; x++) {
-      double xs = (double)x * sw / dw;
-      int x0 = (int)xs, x1 = x0 + 1; if (x1 >= sw) x1 = sw - 1;
-      double xF = xs - x0;
-      const uint8_t *p00 = &src[(y0 * sw + x0) * 4];
-      const uint8_t *p10 = &src[(y0 * sw + x1) * 4];
-      const uint8_t *p01 = &src[(y1 * sw + x0) * 4];
-      const uint8_t *p11 = &src[(y1 * sw + x1) * 4];
-      uint8_t *o = &dst[(y * dw + x) * 4];
-      for (int c = 0; c < 4; c++) {
-        double v = p00[c] * (1.0 - xF) * (1.0 - yF) + p10[c] * xF * (1.0 - yF) +
-                   p01[c] * (1.0 - xF) * yF + p11[c] * xF * yF;
-        if (v < 0) v = 0; if (v > 255) v = 255;
-        o[c] = (uint8_t)(v + 0.5);
-      }
-    }
-  }
-  return dst;
-}
-
-/* Returns -1 on decode/resize/write failure so the caller falls back to
- * copying the source bytes verbatim instead. */
-static int
-icon_cache_write_resized(const uint8_t *buf, size_t len, const char *cached_path) {
-  int w = 0, h = 0, c = 0;
-  uint8_t *rgba = stbi_load_from_memory(buf, (int)len, &w, &h, &c, 4);
-  if (!rgba || w <= 0 || h <= 0) {
-    if (rgba) stbi_image_free(rgba);
-    return -1;
-  }
-  if (w <= CR_ICON_MAX_DIM && h <= CR_ICON_MAX_DIM) {
-    stbi_image_free(rgba);
-    return -1; /* already small enough, not worth re-encoding */
-  }
-  uint8_t *resized = icon_resize_rgba(rgba, w, h, CR_ICON_MAX_DIM, CR_ICON_MAX_DIM);
-  stbi_image_free(rgba);
-  if (!resized) {
-    return -1;
-  }
-  int ok = stbi_write_png(cached_path, CR_ICON_MAX_DIM, CR_ICON_MAX_DIM, 4, resized, CR_ICON_MAX_DIM * 4);
-  free(resized);
-  return ok ? 0 : -1;
-}
-
 int
 cache_media_ensure(const char *title_id, int is_pic0, char *cached_path, size_t cached_size) {
   char src[512];
@@ -715,10 +777,6 @@ cache_media_ensure(const char *title_id, int is_pic0, char *cached_path, size_t 
   if (read_file_bytes(src, &buf, &len) != 0 || !buf || len == 0) {
     free(buf);
     return -1;
-  }
-  if (!is_pic0 && icon_cache_write_resized(buf, len, cached_path) == 0) {
-    free(buf);
-    return 0;
   }
   int rc = write_file_atomic(cached_path, buf, len);
   free(buf);

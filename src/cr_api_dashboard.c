@@ -37,12 +37,12 @@ cr_api_dashboard_handle(int fd, const char *method, const char *path,
   }
   if (!strcmp(path, "/dashboard.css")) {
     send_asset(fd, "text/css; charset=utf-8", g_dashboard_css, accepts_gzip,
-               g_dashboard_css_gz, g_dashboard_css_gz_len, 1);
+               g_dashboard_css_gz, g_dashboard_css_gz_len, 0);
     return 1;
   }
   if (!strcmp(path, "/dashboard.js")) {
     send_asset(fd, "application/javascript; charset=utf-8", g_dashboard_js, accepts_gzip,
-               g_dashboard_js_gz, g_dashboard_js_gz_len, 1);
+               g_dashboard_js_gz, g_dashboard_js_gz_len, 0);
     return 1;
   }
   if (!strcmp(path, "/CheatRunner.png") || !strcmp(path, "/favicon.png") ||
@@ -50,29 +50,16 @@ cr_api_dashboard_handle(int fd, const char *method, const char *path,
     http_send_png_asset(fd);
     return 1;
   }
+  /* A 404 makes browsers drop the offline cache an older build installed. */
   if (!strcmp(path, "/cache.appcache")) {
-    static const char appcache[] =
-      "CACHE MANIFEST\n"
-      "# CheatRunner v0.17.1\n"
-      "# Build: " __DATE__ " " __TIME__ "\n"
-      "\n"
-      "CACHE:\n"
-      "/\n"
-      "/dashboard.css\n"
-      "/dashboard.js\n"
-      "/CheatRunner.png\n"
-      "\n"
-      "NETWORK:\n"
-      "*\n";
-    http_send_response(fd, 200, "text/cache-manifest; charset=utf-8",
-      (const uint8_t *)appcache, sizeof(appcache) - 1);
+    http_send_response(fd, 404, "text/plain", (const uint8_t *)"gone", 4);
     return 1;
   }
   if (!strcmp(path, "/manifest.json")) {
     static const char manifest[] =
       "{\"name\":\"CheatRunner\",\"short_name\":\"CheatRunner\","
       "\"description\":\"PS5 Web Launcher & Cheat Trainer\","
-      "\"theme_color\":\"#E11D48\",\"background_color\":\"#050505\","
+      "\"theme_color\":\"#3B82F6\",\"background_color\":\"#070b16\","
       "\"display\":\"standalone\","
       "\"icons\":[{\"src\":\"/CheatRunner.png\",\"sizes\":\"192x192\",\"type\":\"image/png\"},"
       "{\"src\":\"/CheatRunner.png\",\"sizes\":\"512x512\",\"type\":\"image/png\","

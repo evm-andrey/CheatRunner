@@ -4,8 +4,7 @@
 #include <stdint.h>
 #include <string.h>
 
-/* Confirmed on PS5 via buttons_down captures - Mono AOT strips the
- * managed enum's metadata, so there's no other way to get these values. */
+/* Values captured from buttons_down on a console; Mono AOT strips the enum metadata, so there is no other source. */
 typedef struct {
   const char *name;
   uint32_t    value;

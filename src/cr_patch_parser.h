@@ -82,13 +82,13 @@ typedef struct {
     int   rolled_back;
     int   rollback_errors;
     int   verify_fail_count;
+    int   skipped_lines;   /* mask lines whose pattern was not found; the rest were applied */
     pid_t pid;   /* pid of the process that was patched; 0 if apply failed before attach */
     char  error[64];
     char  message[256];
 } patch_apply_result_t;
 
-/* Returns 1 when a mask line has trailing original pattern bytes not covered by the write.
- * Condition: type==MASK && match_offset>=0 && match_offset+value_len < pattern_len */
+/* True when a mask line has trailing original pattern bytes the write does not cover. */
 int cr_patch_line_has_trailing_pattern_bytes(const patch_line_t *ln);
 
 /* Computes a stable 8-hex-char entryId from source metadata; call after those fields are populated. */
@@ -106,7 +106,7 @@ int patch_find_xml_for_title(const char *title_id, char *out_path, size_t out_sz
 int patch_parse_xml_file(const char *xml_path, const char *title_id,
                          cr_patch_source_kind_t source_kind, patch_doc_t *doc);
 
-/* Applies all lines in one entry with backup/rollback (all-or-nothing); result may be NULL. */
+/* Applies the lines of one entry with backup/rollback; mask lines that find no match are skipped. result may be NULL. */
 int patch_apply_entry_ex(const char *title_id, const patch_entry_t *entry,
                          patch_apply_result_t *result);
 
@@ -125,6 +125,7 @@ void patch_clear_backups_for_pid(pid_t pid);
 
 /* Force a rescan of the patch directories on next lookup; also clears applied state. */
 void patch_index_invalidate(void);
+void patch_index_refresh(void);
 
 /* List/toggle/delete patch XML files; dir_idx: 0=xml_prospero, 1=xml, 2=external. Toggle renames .xml <-> .xml.off. */
 char *patch_files_list_json(void);

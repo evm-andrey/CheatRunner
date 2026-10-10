@@ -1,10 +1,78 @@
 # CheatRunner — Changelog
 
-## v0.17.2
+## v0.18
+
+- **Added: 16 languages** with flags and a language picker; Arabic and Persian read right to left.
+- **Added: controller shortcut and a "★ CheatRunner" game-menu entry** that open a game's trainer (off by default).
+- **Added: download the official PS-Game-Patch release from Sources.**
+- **Added: cheat repositories download as one archive** with a live progress panel; unchanged files are skipped.
+- **Added: XML patches placed in /data/cheatrunner/patches are recognized**, in any letter case.
+- **Added: title ID, PS5/PS4 badge, version, time played and last played on every game card.**
+- **Added: Visual effects setting (Full / Reduced);** Reduced is the default in the PS5 browser.
+- **Added: command palette (Ctrl/Cmd+K), collapsible menu and a QR code to open the dashboard on a phone.**
+- **Added: update notice, and Discord, X, Bluesky and Support buttons in the top bar.**
+- **Added: Sources links to hencheats.vercel.app and PS-Game-Patch.**
+- **Added: a tip in the Patches tab and the README about patches that only work at game start.**
+- **Added: a health summary in System and a Troubleshooting section in Settings.**
+- **Added: step-by-step debug logs for the system-UI hooks;** the log level defaults to debug and the log file keeps every session.
+- **Added: a short build id in the log header and version line,** so each session shows which ELF was running.
+- **Changed: `build-cheatrunner.sh` shows one progress line, prints the end of the log when the build fails, and has `--clean`, `--sqlite`, `--no-sqlite`, `-j` and `--verbose`.**
+- **Added: the log shows the original and new bytes of every patch line.**
+- **Changed: cheats turn on and off with a single click;** address modes, the address cache and the verify/force options are gone.
+- **Changed: a version or address mismatch no longer locks a cheat's switch.**
+- **Changed: new dashboard** with a left menu, a full-page trainer (Cheats / Patches / Files) and a shorter Settings page.
+- **Changed: Midnight is the default theme, and the dashboard uses the system font.**
+- **Changed: "HEN Cheats Collection" is marked Recommended in Sources.**
+- **Changed: long lists load in batches and covers are small cached thumbnails,** so the PS5 browser stays smooth.
+- **Changed: autoload waits 1 second after every cheat and patch it turns on.**
+- **Changed: UI polish** — motion, loading skeletons, dialogs, filters and phone layouts.
+- **Changed: the system-UI hook waits 10 s after the shell's libraries load** and follows new shell processes, including after rest mode.
+- **Changed: the system-UI hooks are written from inside the shell in one step** and skipped when they can't be placed safely.
+- **Changed: CheatRunner stops hooking after two shell restarts that follow a failed injection** and shows a notice.
+- **Changed: new dashboard look with a readiness strip on the trainer page, a slimmer top bar and clear empty and error states.**
+- **Changed: the dashboard keeps its effects in desktop and modern browsers, and the PS5 browser uses the lighter Reduced preset until you pick Full in Settings.**
+- **Changed: Discord, X, Bluesky and a labelled Support button are back in the top bar, and cheat and patch authors are shown prominently.**
+- **Added: a download in progress shows in the top bar on every page.**
+- **Added: new names to the supporters list.**
+- **Changed: the Support text is larger and easier to read, and the heart floats again** (not in the Reduced preset).
+- **Changed: CheatRunner.elf is about 3.5 MB smaller** (smaller logo, lossless tile images, unused code removed at link time, bundled libraries built for size).
+- **Removed: unused code,** including the old online cheat search and its `/api/sources/jobs`, `/api/cheats/sources` and `/api/cheats/remote/*` endpoints.
+- **Added: CheatRunner Patches repository in Sources,** with a patch source picker.
+- **Changed: when a game has patches from both repositories, only the CheatRunner Patches ones are listed;** they are saved in their own `cheatrunner` subfolders, so PS-Game-Patch never overwrites them.
+- **Fixed: a cheat file that failed to load was shown as missing, and a failed state read left the switches off without saying why.**
+- **Changed: CheatRunner never restarts or kills the system UI anymore;** hooks left by an earlier session are reused.
+- **Changed: hooking the system UI no longer alters the shell's own permissions,** keeps its extra rights only while working, and the hook stays marked as installed even if the handshake fails.
+- **Changed: "Report an issue" opens the GitHub issue tracker, and builds use the Makefile only.**
+- **Fixed: the version and name of homebrew games mounted from a folder were not detected,** so their cheats showed "version undetected".
+- **Fixed: cheats with a long Mastercode name (for example The Witcher 3) showed their sub-cheats as conflicting;** turning one on switched the Mastercode off and on again.
+- **Fixed: cheats and patches with large byte strings could not be enabled.**
+- **Fixed: patch XML files were not found** (names with spaces or brackets, new files, sub-folders).
+- **Fixed: XML patches that jump into a code cave could crash the game.**
+- **Fixed: a patch with a pattern line that finds no match is no longer undone entirely;** the lines that match are applied.
+- **Fixed: the controller shortcut and the ★ menu on firmware 4.xx,** where the system UI has more modules than the hook could list.
+- **Fixed: downloaded cheat files with a hash or process name after the version (for example PPSA31246_01.200.000_ef4d3664.mc4) lost their version and matched any game version.**
+- **Fixed: cheats and patches on firmware 13.60.**
+- **Fixed: the Patches tab reloaded and jumped when a patch was applied or restored.**
+- **Fixed: game covers cut off or missing in the PS5 browser.**
+- **Fixed: laggy scrolling, blue lines after switching tabs and a cut-off Autoload pill in the PS5 browser.**
+- **Fixed: the dashboard layout on phones, especially in Arabic and Persian,** and the unstyled page when the stylesheet failed to load.
+- **Fixed: time played and last played now match the PS5 home screen.**
+- **Fixed: the controller shortcut gave up for good after a few rest-mode wakes.**
+- **Fixed: system-UI crashes and restarts caused by injection** (a stalled injection, unsupported instructions, restarting CheatRunner).
+- **Fixed: the ★ menu entry was sometimes missing after a game launch.**
+- **Fixed: the controller shortcut restarting the system UI** after the shell opened its own web processes.
+- **Fixed: a new CheatRunner could not replace the running one, and the browser could keep an old dashboard.**
+- **Fixed: downloads stop with a clear message when files cannot be saved.**
+- **Fixed: the D-pad works right away in the PS5 browser.**
+- **Removed: the Create-button shortcut, "Find cheats online", "Copy cheats folder", the profile editor, thermals and fan panel, and the notification bell.**
+
+<details>
+<summary><b>v0.17.2</b></summary>
 
 - **Fixed: writes on FW 13.60.**
 
-## v0.17.1
+<details>
+<summary><b>v0.17.1</b></summary>
 
 - **Added: support for 13.60 firmware** — rebuilt against the latest ps5-payload-sdk.
 
