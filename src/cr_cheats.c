@@ -1004,7 +1004,7 @@ apply_cheat_json_impl(const char *title_id, int mod_index, int turn_on, char *er
   int pre_n = 0;                /* entries pre-read */
   int      wi_is_cave[64];      /* 1 if len >= 16 (code cave) */
   int      written_order[64];   /* pre_n indices in actual write order (for rollback) */
-  int      write_ok_n = 0;      /* entries successfully written */
+  int      write_attempt_n = 0;      /* entries attempted; even failed writes may change memory */
 
   if (!find_cheat_file_for_title(title_id, path, sizeof(path), &kind)) {
     snprintf(err, err_size, "no cheat file for %s", title_id);
@@ -1536,10 +1536,12 @@ apply_cheat_json_impl(const char *title_id, int mod_index, int turn_on, char *er
         size_t   _sp = (size_t)(ROUND_PG_UP((uintptr_t)addr + wlen) - (uintptr_t)_pg);
         cr_log("debug", "cheats.mem",
                "begin title=%s mod=%d write=%d addr=0x%lx len=%zu page=0x%lx span=0x%zx type=%s",
-               title_id, mod_index, write_ok_n, (long)addr, wlen, (long)_pg, _sp,
+               title_id, mod_index, write_attempt_n, (long)addr, wlen, (long)_pg, _sp,
                wi_is_cave[i] ? "cave" : "hook");
         /* Skips kernel_get_vmem_protection, which can dereference garbage and panic on PS4 BC games
          * and PS5 games with special vmem entry types. */
+        /* Track before writing: a failed write or readback may leave changed bytes. */
+        written_order[write_attempt_n++] = i;
         int wrc = write_process_memory_forced(pid, addr, data, wlen);
         cr_log("debug", "cheats.mem", "write_rc=%d addr=0x%lx", wrc, (long)addr);
         if (wrc != 0) {
@@ -1552,16 +1554,20 @@ apply_cheat_json_impl(const char *title_id, int mod_index, int turn_on, char *er
           uint8_t *cur_v CR_AUTOFREE = malloc(wlen);
           int rdrc = cur_v ? read_process_memory(pid, addr, cur_v, wlen) : -1;
           if (rdrc != 0) {
-            cr_log("warn", "cheats.mem",
-                   "ext_verify_unreadable addr=0x%lx len=%zu — write assumed ok",
+            rc = -1;
+            snprintf(err, err_size,
+                     "entry[%d] readback failed at 0x%lx; rolling back", i, (long)addr);
+            cr_log("error", "cheats.mem",
+                   "ext_verify_unreadable addr=0x%lx len=%zu — rolling back",
                    (long)addr, wlen);
+            break;
           } else if (memcmp(cur_v, data, wlen) != 0) {
             char exp_h[52] = {0}, got_h[52] = {0};
             fmt_hex16(data, wlen, exp_h, sizeof(exp_h));
             fmt_hex16(cur_v, wlen, got_h, sizeof(got_h));
             cr_log("error", "cheats.mem",
                    "ext_verify_fail title=%s mod=%d write=%d addr=0x%lx exp=[%s] got=[%s]",
-                   title_id, mod_index, write_ok_n, (long)addr, exp_h, got_h);
+                   title_id, mod_index, write_attempt_n - 1, (long)addr, exp_h, got_h);
             rc = -1;
             snprintf(err, err_size,
                      "entry[%d] verify failed at 0x%lx — bytes not observed after write; see cheats.mem logs",
@@ -1580,17 +1586,16 @@ apply_cheat_json_impl(const char *title_id, int mod_index, int turn_on, char *er
                  (long)_pg, _sp, rrc);
         }
         cr_log("info", "cheats", "write[%d] addr=0x%lx len=%zu type=%s ok",
-               write_ok_n, (long)addr, wlen, wi_is_cave[i] ? "cave" : "hook");
-        written_order[write_ok_n++] = i;
+               write_attempt_n - 1, (long)addr, wlen, wi_is_cave[i] ? "cave" : "hook");
       }
     }
   }
 
   /* ---- Rollback on failure ---- */
-  if (rc != 0 && write_ok_n > 0) {
+  if (rc != 0 && write_attempt_n > 0) {
     cr_log("info", "cheats.rollback", "begin title=%s mod=%d writes_to_undo=%d",
-           title_id, mod_index, write_ok_n);
-    for (int i = write_ok_n - 1; i >= 0; i--) {
+           title_id, mod_index, write_attempt_n);
+    for (int i = write_attempt_n - 1; i >= 0; i--) {
       int wi = written_order[i];
       int rrc = write_process_memory_forced(pid, applied[wi].addr, applied[wi].old_bytes, applied[wi].len);
       if (rrc == 0) {
@@ -1606,7 +1611,7 @@ apply_cheat_json_impl(const char *title_id, int mod_index, int turn_on, char *er
       }
     }
     cr_log("warn", "cheats", "rollback performed for %s mod=%d (%d patches)",
-           title_id, mod_index, write_ok_n);
+           title_id, mod_index, write_attempt_n);
   } else if (rc == 0) {
     cJSON *name_j = cJSON_GetObjectItem(mod, "name");
     const char *mod_name = cJSON_IsString(name_j) && name_j->valuestring ? name_j->valuestring : "mod";
@@ -1695,7 +1700,7 @@ apply_cheat_json_impl(const char *title_id, int mod_index, int turn_on, char *er
     g_last_apply_rec.cave_count   = hcc;
     g_last_apply_rec.hook_count   = hch;
     g_last_apply_rec.ts_ms        = now_ms();
-    int wc = write_ok_n < LAST_APPLY_WRITES_MAX ? write_ok_n : LAST_APPLY_WRITES_MAX;
+    int wc = write_attempt_n < LAST_APPLY_WRITES_MAX ? write_attempt_n : LAST_APPLY_WRITES_MAX;
     for (int _i = 0; _i < wc; _i++) {
       int wi = written_order[_i];
       g_last_apply_rec.writes[_i].addr    = applied[wi].addr;
