@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,6 +12,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cr_api.h"
@@ -27,13 +29,58 @@ char g_listen_ip[64] = "127.0.0.1";
 int g_http_listen_fd = -1;
 
 #define HTTP_MAX_CONCURRENT 24
+/* Leave parsing/health/recovery capacity when ordinary handlers are stuck. */
+#define HTTP_MAX_ROUTES (HTTP_MAX_CONCURRENT - 4)
+#define HTTP_REQUEST_TIMEOUT_MS 10000
+static int g_active_routes;
+static int g_probe_active;
+static long long g_probe_started_ms;
+static pthread_mutex_t g_shutdown_route_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int  g_active_clients = 0;
 static volatile long long g_too_many_requests_count = 0;
 static pthread_mutex_t g_active_lock = PTHREAD_MUTEX_INITIALIZER;
 
-int  cr_http_active_clients(void)          { return g_active_clients; }
+int cr_http_active_clients(void) {
+  pthread_mutex_lock(&g_active_lock);
+  int n = g_active_clients;
+  pthread_mutex_unlock(&g_active_lock);
+  return n;
+}
 int  cr_http_max_concurrent(void)          { return HTTP_MAX_CONCURRENT; }
-long long cr_http_too_many_requests_count(void) { return g_too_many_requests_count; }
+long long cr_http_too_many_requests_count(void) {
+  pthread_mutex_lock(&g_active_lock);
+  long long n = g_too_many_requests_count;
+  pthread_mutex_unlock(&g_active_lock);
+  return n;
+}
+
+static long long http_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+void cr_http_work_stats(int *routes, long long *probe_age_ms) {
+  pthread_mutex_lock(&g_active_lock);
+  *routes = g_active_routes;
+  *probe_age_ms = g_probe_active ? http_now_ms() - g_probe_started_ms : -1;
+  pthread_mutex_unlock(&g_active_lock);
+}
+
+/* An absolute deadline also bounds clients trickling headers/body forever. */
+static ssize_t http_recv_until(int fd, void *buf, size_t len, long long deadline) {
+  for (;;) {
+    long long remaining = deadline - http_now_ms();
+    if (remaining <= 0) { errno = ETIMEDOUT; return -1; }
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int rc = poll(&pfd, 1, (int)remaining);
+    if (rc < 0 && errno == EINTR) continue;
+    if (rc <= 0) { if (!rc) errno = ETIMEDOUT; return -1; }
+    ssize_t n = recv(fd, buf, len, MSG_DONTWAIT);
+    if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+    return n;
+  }
+}
 
 typedef struct { int fd; char ip[64]; } http_client_ctx_t;
 static void http_handle_client(int fd, const char *client_ip);
@@ -193,6 +240,7 @@ http_handle_client(int fd, const char *client_ip) {
   }
   size_t off = 0;
   size_t body_len = 0;
+  long long deadline = http_now_ms() + HTTP_REQUEST_TIMEOUT_MS;
 
   struct timeval tv;
   tv.tv_sec = 10;
@@ -209,7 +257,7 @@ http_handle_client(int fd, const char *client_ip) {
       free(req);
       return;
     }
-    int n = recv(fd, req + off, cap - off, 0);
+    int n = http_recv_until(fd, req + off, cap - off, deadline);
     if (n <= 0) {
       if (n < 0 && errno == EINTR) {
         continue;
@@ -265,7 +313,7 @@ http_handle_client(int fd, const char *client_ip) {
       free(req);
       return;
     }
-    int n = recv(fd, req + off, cap - off, 0);
+    int n = http_recv_until(fd, req + off, cap - off, deadline);
     if (n <= 0) {
       if (n < 0 && errno == EINTR) {
         continue;
@@ -300,8 +348,43 @@ http_handle_client(int fd, const char *client_ip) {
     query = "";
   }
   int accepts_gzip = request_accepts_gzip(req);
+  int health = !strcmp(target, "/api/health");
+  int shutdown_route = !strcmp(target, "/api/dev/shutdown");
+  int probe = !strcmp(target, "/api/cheats/state") || !strcmp(target, "/api/running") ||
+              !strcmp(target, "/api/debug/process") || !strcmp(target, "/api/cheats/debug") ||
+              !strcmp(target, "/api/cheats/address-debug");
+  int ordinary = !health && !shutdown_route;
+  int busy = 0;
+  pthread_mutex_lock(&g_active_lock);
+  if (ordinary && (g_active_routes >= HTTP_MAX_ROUTES || (probe && g_probe_active))) {
+    busy = 1;
+    g_too_many_requests_count++;
+  } else if (ordinary) {
+    g_active_routes++;
+    if (probe) { g_probe_active = 1; g_probe_started_ms = http_now_ms(); }
+  }
+  pthread_mutex_unlock(&g_active_lock);
+  if (busy) {
+    http_send_json(fd, 503, probe ? "{\"ok\":false,\"error\":\"probe_busy\"}" :
+                                  "{\"ok\":false,\"error\":\"too_many_requests\"}");
+    free(req);
+    return;
+  }
+  /* Only one shutdown handler may use reserved capacity; do not queue on it. */
+  if (shutdown_route && pthread_mutex_trylock(&g_shutdown_route_lock) != 0) {
+    http_send_json(fd, 503, "{\"ok\":false,\"error\":\"shutdown_busy\"}");
+    free(req);
+    return;
+  }
   http_route(fd, method, target, query, client_ip ? client_ip : "unknown",
              body_ptr ? body_ptr : "", body_len, accepts_gzip);
+  if (shutdown_route) pthread_mutex_unlock(&g_shutdown_route_lock);
+  if (ordinary) {
+    pthread_mutex_lock(&g_active_lock);
+    g_active_routes--;
+    if (probe) g_probe_active = 0;
+    pthread_mutex_unlock(&g_active_lock);
+  }
   free(req);
 }
 
@@ -412,6 +495,9 @@ http_server_thread(void *arg) {
       { int nd = 1; setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd)); }
       /* The ProsperoOS default SNDBUF caps outbound throughput; set it on each accepted socket. */
       { int sndbuf = 4 * 1024 * 1024; setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)); }
+      /* Also cover the rejection response, sent before starting a worker. */
+      { struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)); }
       char client_ip[64] = {0};
       inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
 

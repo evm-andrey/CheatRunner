@@ -445,11 +445,11 @@ handle_api_health(int fd) {
   long long now_ms = (long long)_now.tv_sec * 1000LL + (long long)(_now.tv_nsec / 1000000L);
   long long uptime  = g_startup_ms ? (now_ms - g_startup_ms) : 0;
 
-  pthread_mutex_lock(&g_games_cache_lock);
+  if (pthread_mutex_trylock(&g_games_cache_lock) != 0) goto degraded;
   int games_busy = g_games_scan_busy;
   pthread_mutex_unlock(&g_games_cache_lock);
 
-  pthread_mutex_lock(&g_repo_mirror.lock);
+  if (pthread_mutex_trylock(&g_repo_mirror.lock) != 0) goto degraded;
   int mirror_busy = (g_repo_mirror.state == REPO_MIRROR_RUNNING);
   pthread_mutex_unlock(&g_repo_mirror.lock);
 
@@ -457,7 +457,7 @@ handle_api_health(int fd) {
   char ls_health_title[16];
   int  ls_health_busy;
   uint64_t ls_health_started_ms;
-  pthread_mutex_lock(&g_launch_status_lock);
+  if (pthread_mutex_trylock(&g_launch_status_lock) != 0) goto degraded;
   ls_health_busy       = g_launch_status.busy;
   ls_health_started_ms = g_launch_status.started_ms;
   snprintf(ls_health_phase, sizeof(ls_health_phase), "%s", g_launch_status.phase);
@@ -471,13 +471,17 @@ handle_api_health(int fd) {
   int  http_active  = cr_http_active_clients();
   int  http_max     = cr_http_max_concurrent();
   long long http_tmr = cr_http_too_many_requests_count();
+  int routes;
+  long long probe_age;
+  cr_http_work_stats(&routes, &probe_age);
 
-  char buf[640];
+  char buf[800];
   snprintf(buf, sizeof(buf),
            "{\"ok\":true,\"version\":\"%s\",\"uptimeMs\":%lld,"
            "\"busy\":{\"gamesScan\":%s,\"repoMirror\":%s,\"launch\":%s},"
            "\"launch\":{\"busy\":%s,\"phase\":\"%s\",\"titleId\":\"%s\",\"ageMs\":%lld,\"stale\":%s},"
-           "\"http\":{\"activeClients\":%d,\"maxConcurrent\":%d,\"tooManyRequestsCount\":%lld}}",
+           "\"http\":{\"activeClients\":%d,\"maxConcurrent\":%d,\"tooManyRequestsCount\":%lld,"
+           "\"activeRoutes\":%d,\"probeAgeMs\":%lld}}",
            CHEATRUNNER_VERSION, uptime,
            games_busy        ? "true" : "false",
            mirror_busy       ? "true" : "false",
@@ -485,8 +489,24 @@ handle_api_health(int fd) {
            ls_health_busy    ? "true" : "false",
            ls_health_phase, ls_health_title, launch_age_ms,
            launch_stale      ? "true" : "false",
-           http_active, http_max, http_tmr);
+           http_active, http_max, http_tmr, routes, probe_age);
   http_send_json(fd, 200, buf);
+  return;
+
+degraded: {
+    /* Never wait behind the operation whose health we are trying to inspect. */
+    int active_routes;
+    long long age;
+    cr_http_work_stats(&active_routes, &age);
+    char fallback[512];
+    snprintf(fallback, sizeof(fallback),
+             "{\"ok\":true,\"degraded\":true,\"detailsAvailable\":false,\"version\":\"%s\","
+             "\"http\":{\"activeClients\":%d,\"maxConcurrent\":%d,\"activeRoutes\":%d,"
+             "\"probeAgeMs\":%lld,\"tooManyRequestsCount\":%lld}}",
+             CHEATRUNNER_VERSION, cr_http_active_clients(), cr_http_max_concurrent(),
+             active_routes, age, cr_http_too_many_requests_count());
+    http_send_json(fd, 200, fallback);
+  }
 }
 
 void
@@ -3856,25 +3876,27 @@ handle_api_dev_shutdown(int fd, const char *method, const char *query, const cha
     return;
   }
 
-  pthread_mutex_lock(&g_cfg_lock);
+  if (pthread_mutex_trylock(&g_cfg_lock) != 0) {
+    http_send_json(fd, 503, "{\"ok\":false,\"error\":\"config_busy\"}");
+    return;
+  }
   enabled = g_cfg.dev_reload_enabled;
   delay_ms = g_cfg.dev_shutdown_delay_ms;
   pthread_mutex_unlock(&g_cfg_lock);
 
   if (!enabled) {
-    cr_log("warn", "dev", "shutdown rejected: dev reload disabled");
     http_send_json(fd, 403,
                    "{\"ok\":false,\"error\":\"dev_reload_disabled\",\"message\":\"Dev reload mode is disabled.\"}");
     return;
   }
 
-  cr_log("info", "dev", "shutdown request received from %s", client_ip ? client_ip : "unknown");
-  cr_log("info", "dev", "shutdown accepted; exiting in %dms", delay_ms);
+  (void)client_ip;
   snprintf(body, sizeof(body),
            "{\"ok\":true,\"message\":\"CheatRunner is shutting down. Send the new ELF from your PC.\",\"delayMs\":%d}",
            delay_ms);
-  http_send_json(fd, 200, body);
+  /* Arm the deadline before response I/O, logging or cleanup can block. */
   cheatrunner_request_shutdown(delay_ms);
+  http_send_json(fd, 200, body);
 }
 
 /* ── /api/user/context ──────────────────────────────────────────── */
